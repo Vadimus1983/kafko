@@ -1,0 +1,422 @@
+use crate::compression::Compression;
+use crate::error::{KafkoError, Result};
+use crate::record::Record;
+use crate::segment::Segment;
+use crate::sparse_index::SparseIndex;
+use bytes::BytesMut;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+#[derive(Clone, Copy, Debug)]
+pub struct LogConfig {
+    pub segment_size_threshold: u64,
+    pub index_interval: u64,
+    pub max_segment_age: Option<Duration>,
+    pub max_partition_bytes: Option<u64>,
+    pub retention_check_interval: Duration,
+    pub batch_max_records: usize,
+    pub batch_max_bytes: u64,
+    pub compression: Compression,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            segment_size_threshold: 1 << 30,
+            index_interval: 4 * 1024,
+            max_segment_age: None,
+            max_partition_bytes: None,
+            retention_check_interval: Duration::from_secs(60),
+            batch_max_records: 1024,
+            batch_max_bytes: 64 * 1024,
+            compression: Compression::None,
+        }
+    }
+}
+
+pub struct Log {
+    dir: PathBuf,
+    config: LogConfig,
+    segments: Vec<IndexedSegment>,
+    next_offset: u64,
+}
+
+struct IndexedSegment {
+    segment: Segment,
+    index: SparseIndex,
+}
+
+impl Log {
+    pub async fn create(dir: &Path, config: LogConfig) -> Result<Self> {
+        tokio::fs::create_dir_all(dir).await?;
+        let segment = Segment::create(dir, 0).await?;
+        let index = SparseIndex::create(dir, 0, config.index_interval).await?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            config,
+            segments: vec![IndexedSegment { segment, index }],
+            next_offset: 0,
+        })
+    }
+
+    /// Opens an existing log or creates a fresh one if the directory is empty.
+    ///
+    /// Recovers the active (last) segment by CRC-scanning the `.log` file and truncating
+    /// torn or corrupted records at the tail. Rebuilds the active segment's sparse index
+    /// from scratch. Trusts older segments and their existing indexes.
+    pub async fn open(dir: &Path, config: LogConfig) -> Result<Self> {
+        tokio::fs::create_dir_all(dir).await?;
+        let base_offsets = discover_segment_offsets(dir).await?;
+
+        if base_offsets.is_empty() {
+            return Self::create(dir, config).await;
+        }
+
+        let mut segments = Vec::with_capacity(base_offsets.len());
+        for &base in &base_offsets[..base_offsets.len() - 1] {
+            let segment = Segment::open(dir, base).await?;
+            let index = SparseIndex::open(dir, base, config.index_interval).await?;
+            segments.push(IndexedSegment { segment, index });
+        }
+
+        let active_base = *base_offsets.last().unwrap();
+        let (active_segment, active_index, active_record_count) =
+            recover_active_segment(dir, active_base, config.index_interval).await?;
+        segments.push(IndexedSegment {
+            segment: active_segment,
+            index: active_index,
+        });
+
+        let next_offset = active_base + active_record_count;
+
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            config,
+            segments,
+            next_offset,
+        })
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn config(&self) -> &LogConfig {
+        &self.config
+    }
+
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.segments.iter().map(|s| s.segment.size()).sum()
+    }
+
+    pub async fn append(&mut self, record: Record) -> Result<u64> {
+        let wire_size_estimate = record.wire_size();
+        let compression = self.config.compression;
+
+        let should_rotate = self
+            .segments
+            .last()
+            .unwrap()
+            .segment
+            .would_overflow(wire_size_estimate, self.config.segment_size_threshold);
+
+        if should_rotate {
+            let new_segment = Segment::create(&self.dir, self.next_offset).await?;
+            let new_index =
+                SparseIndex::create(&self.dir, self.next_offset, self.config.index_interval)
+                    .await?;
+            self.segments.push(IndexedSegment {
+                segment: new_segment,
+                index: new_index,
+            });
+        }
+
+        let mut buf = BytesMut::with_capacity(wire_size_estimate);
+        let actual_size = record.encode_with(&mut buf, compression);
+
+        let active = self.segments.last_mut().unwrap();
+        let file_pos = active.segment.append(&buf).await?;
+
+        let offset = self.next_offset;
+        active
+            .index
+            .track_append(offset, file_pos, actual_size)
+            .await?;
+
+        self.next_offset += 1;
+        Ok(offset)
+    }
+
+    /// Appends a batch of records in a single disk write. Returns the assigned offsets
+    /// in order. Used by the partition actor to coalesce concurrent producer sends.
+    pub async fn append_batch(&mut self, records: Vec<Record>) -> Result<Vec<u64>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sizes = Vec::with_capacity(records.len());
+        let mut total_wire_size = 0usize;
+        for record in &records {
+            let s = record.wire_size();
+            sizes.push(s);
+            total_wire_size += s;
+        }
+
+        let should_rotate = self
+            .segments
+            .last()
+            .unwrap()
+            .segment
+            .would_overflow(total_wire_size, self.config.segment_size_threshold);
+        if should_rotate {
+            let new_segment = Segment::create(&self.dir, self.next_offset).await?;
+            let new_index =
+                SparseIndex::create(&self.dir, self.next_offset, self.config.index_interval)
+                    .await?;
+            self.segments.push(IndexedSegment {
+                segment: new_segment,
+                index: new_index,
+            });
+        }
+
+        let compression = self.config.compression;
+        let mut buf = BytesMut::with_capacity(total_wire_size);
+        let mut actual_sizes = Vec::with_capacity(records.len());
+        let mut offsets = Vec::with_capacity(records.len());
+        let mut current_offset = self.next_offset;
+        for record in records {
+            offsets.push(current_offset);
+            current_offset += 1;
+            let actual = record.encode_with(&mut buf, compression);
+            actual_sizes.push(actual);
+        }
+
+        let active = self.segments.last_mut().unwrap();
+        let mut file_pos = active.segment.append(&buf).await?;
+
+        for (i, &size) in actual_sizes.iter().enumerate() {
+            active
+                .index
+                .track_append(offsets[i], file_pos, size)
+                .await?;
+            file_pos += size as u64;
+        }
+
+        self.next_offset = current_offset;
+        // sizes (computed up-front for estimation) is no longer used after compression-aware sizing;
+        // silence the unused warning by ignoring it.
+        let _ = sizes;
+        Ok(offsets)
+    }
+
+    pub async fn read_record_at(&mut self, offset: u64) -> Result<Option<Record>> {
+        if offset >= self.next_offset {
+            return Ok(None);
+        }
+
+        let seg_idx = self.find_segment_index(offset);
+        let segment_pair = &mut self.segments[seg_idx];
+        let (file_pos, starting_offset) = segment_pair.index.lookup(offset);
+
+        let remaining = segment_pair.segment.size().saturating_sub(file_pos);
+        if remaining == 0 {
+            return Ok(None);
+        }
+
+        // v0.1: read the entire remainder of the segment. For large segments this is
+        // wasteful; a chunked read pattern is a v0.2 optimization.
+        let mut buf = vec![0u8; remaining as usize];
+        let n = segment_pair.segment.read_at(file_pos, &mut buf).await?;
+        let mut slice: &[u8] = &buf[..n];
+
+        let mut current_offset = starting_offset;
+        while !slice.is_empty() {
+            let record = match Record::decode(&mut slice) {
+                Ok(r) => r,
+                Err(KafkoError::Truncated { .. }) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            if current_offset == offset {
+                return Ok(Some(record));
+            }
+            current_offset += 1;
+        }
+
+        Ok(None)
+    }
+
+    pub async fn sync(&mut self) -> Result<()> {
+        let active = self.segments.last_mut().unwrap();
+        active.segment.sync().await?;
+        active.index.sync().await?;
+        Ok(())
+    }
+
+    /// Deletes old segments based on `LogConfig.max_segment_age` and `max_partition_bytes`.
+    /// Never deletes the active (last) segment. Returns the number of segments deleted.
+    pub async fn apply_retention(&mut self) -> Result<u64> {
+        let mut deleted = 0u64;
+        let now_ms = current_timestamp_ms();
+
+        if let Some(max_age) = self.config.max_segment_age {
+            let max_age_ms = max_age.as_millis() as i64;
+            let cutoff = now_ms.saturating_sub(max_age_ms);
+            while self.segments.len() > 1 {
+                let mtime = self.segments[0].segment.last_modified_ms().await?;
+                if mtime < cutoff {
+                    self.delete_oldest_segment().await?;
+                    deleted += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if let Some(max_bytes) = self.config.max_partition_bytes {
+            while self.segments.len() > 1 && self.total_size() > max_bytes {
+                self.delete_oldest_segment().await?;
+                deleted += 1;
+            }
+        }
+
+        Ok(deleted)
+    }
+
+    async fn delete_oldest_segment(&mut self) -> Result<()> {
+        let oldest = self.segments.remove(0);
+        let log_path = oldest.segment.path().to_path_buf();
+        let index_path = log_path.with_extension("index");
+        drop(oldest);
+
+        tokio::fs::remove_file(&log_path).await?;
+        match tokio::fs::remove_file(&index_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
+    fn find_segment_index(&self, offset: u64) -> usize {
+        match self
+            .segments
+            .binary_search_by_key(&offset, |s| s.segment.base_offset())
+        {
+            Ok(i) => i,
+            Err(0) => 0,
+            Err(i) => i - 1,
+        }
+    }
+}
+
+fn current_timestamp_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+async fn discover_segment_offsets(dir: &Path) -> Result<Vec<u64>> {
+    let mut offsets = Vec::new();
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if let Some(prefix) = name_str.strip_suffix(".log") {
+            if let Ok(base) = prefix.parse::<u64>() {
+                offsets.push(base);
+            }
+        }
+    }
+    offsets.sort();
+    Ok(offsets)
+}
+
+async fn recover_active_segment(
+    dir: &Path,
+    base_offset: u64,
+    index_interval: u64,
+) -> Result<(Segment, SparseIndex, u64)> {
+    let mut segment = Segment::open(dir, base_offset).await?;
+    let last_valid_pos = scan_for_last_valid_position(&mut segment).await?;
+    if last_valid_pos < segment.size() {
+        segment.truncate(last_valid_pos).await?;
+    }
+
+    let index_path = dir.join(format!("{:020}.index", base_offset));
+    match tokio::fs::remove_file(&index_path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut index = SparseIndex::create(dir, base_offset, index_interval).await?;
+
+    let record_count = replay_records_to_index(&mut segment, base_offset, &mut index).await?;
+    Ok((segment, index, record_count))
+}
+
+async fn scan_for_last_valid_position(segment: &mut Segment) -> Result<u64> {
+    let size = segment.size() as usize;
+    if size == 0 {
+        return Ok(0);
+    }
+    let mut buf = vec![0u8; size];
+    segment.read_at(0, &mut buf).await?;
+
+    let mut slice: &[u8] = &buf;
+    let mut last_valid_pos = 0u64;
+    while !slice.is_empty() {
+        let start_len = slice.len();
+        match Record::decode(&mut slice) {
+            Ok(_) => {
+                let consumed = (start_len - slice.len()) as u64;
+                last_valid_pos += consumed;
+            }
+            Err(KafkoError::Truncated { .. })
+            | Err(KafkoError::CrcMismatch { .. })
+            | Err(KafkoError::InvalidLength(_)) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(last_valid_pos)
+}
+
+async fn replay_records_to_index(
+    segment: &mut Segment,
+    base_offset: u64,
+    index: &mut SparseIndex,
+) -> Result<u64> {
+    let size = segment.size() as usize;
+    if size == 0 {
+        return Ok(0);
+    }
+    let mut buf = vec![0u8; size];
+    segment.read_at(0, &mut buf).await?;
+
+    let mut slice: &[u8] = &buf;
+    let mut file_pos = 0u64;
+    let mut count = 0u64;
+    while !slice.is_empty() {
+        let start_len = slice.len();
+        let _record = Record::decode(&mut slice)?;
+        let consumed = (start_len - slice.len()) as u64;
+        let offset = base_offset + count;
+        index
+            .track_append(offset, file_pos, consumed as usize)
+            .await?;
+        file_pos += consumed;
+        count += 1;
+    }
+    Ok(count)
+}
