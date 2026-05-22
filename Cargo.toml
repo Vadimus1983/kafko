@@ -15,6 +15,19 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 thiserror = "2.0.18"
 zstd = "0.13"
 
+# Optional — only pulled in when --features http-server is enabled
+axum = { version = "0.7", optional = true }
+anyhow = { version = "1", optional = true }
+
+[features]
+default = []
+http-server = ["axum", "anyhow"]
+
+[[bin]]
+name = "kafko_http"
+path = "src/bin/kafko_http.rs"
+required-features = ["http-server"]
+
 [dev-dependencies]
 proptest = "1"
 criterion = { version = "0.5", features = ["async_tokio"] }
@@ -27,6 +40,7 @@ harness = false
 [[bench]]
 name = "partition"
 harness = false
+
 
 [profile.bench]
 lto = "fat"
