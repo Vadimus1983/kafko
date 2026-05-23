@@ -1,4 +1,4 @@
-//! In-process Kafka-semantics log: topics, partitions, offset-based reads, replay, retention.
+//! In-process log with Kafka-like semantics: topics, partitions, offset-based reads, replay, retention.
 
 pub mod broker;
 pub mod compression;

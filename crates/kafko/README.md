@@ -1,8 +1,17 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../../docs/kafko-wordmark.png">
+    <img src="../../docs/kafko-wordmark-light.png" alt="kafko" width="320">
+  </picture>
+</p>
+
+> **Trademark notice:** Apache Kafka and Kafka are trademarks of the [Apache Software Foundation](https://www.apache.org/). **kafko** is an independent open-source project and is not affiliated with or endorsed by the Apache Software Foundation or Confluent Inc.
+
 # kafko
 
-An in-process, Kafka-semantics log for Rust. Topics, partitions, offset-based reads, replay, retention, compaction — all without a broker, a network hop, or a JVM.
+An in-process log with Kafka-like semantics for Rust. Topics, partitions, offset-based reads, replay, retention, compaction — all without a broker, a network hop, or a JVM.
 
-`kafko` exists for use cases where your data never needs to leave the process: embedded event sourcing, edge buffers, durable in-process pub/sub, deterministic tests for code that talks to real Kafka, single-binary services that want a real log instead of a `VecDeque<T>` under a mutex. SQLite is to PostgreSQL what `kafko` is to Kafka.
+`kafko` exists for use cases where your data never needs to leave the process: embedded event sourcing, edge buffers, durable in-process pub/sub, deterministic integration tests without Docker or a broker, single-binary services that want a real log instead of a `VecDeque<T>` under a mutex. SQLite is to PostgreSQL what `kafko` is to Kafka.
 
 ## What kafko is
 
@@ -18,7 +27,7 @@ A single Rust crate providing:
 - **Async API on `tokio`** — `Producer::send().await` resolves only after the record is durably appended to the OS file
 - **Single-writer-per-partition invariant** — no global mutex on the hot path
 
-The killer use case isn't "replace Kafka." It's **testing applications that consume from real Kafka**: spin up a `Kafko` in the same test process, point your code at it, write deterministic offset-aware integration tests without containers, brokers, or flake.
+The killer use case isn't "replace Kafka." It's **testing log-shaped application code in-process**: open a `Kafko` in the same test binary, call the produce/consume/seek APIs directly, and get offset-aware integration tests without containers, brokers, or flake.
 
 ## What kafko is NOT
 
@@ -132,4 +141,4 @@ Apples-to-apples benchmarks against real Kafka (in Docker, single record per req
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option.
+Licensed under **MIT OR Apache-2.0**, at your option. See [LICENSE-MIT](../../LICENSE-MIT) and [LICENSE-APACHE](../../LICENSE-APACHE).

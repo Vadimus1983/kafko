@@ -2,7 +2,7 @@
 name = "kafko"
 version = "0.1.0"
 edition = "2024"
-description = "In-process Kafka-semantics log: topics, partitions, offset-based reads, replay, retention."
+description = "In-process log with Kafka-like semantics: topics, partitions, offset-based reads, replay, retention."
 license = "MIT OR Apache-2.0"
 keywords = ["kafka", "log", "event-sourcing", "embedded", "wal"]
 categories = ["data-structures", "asynchronous"]
