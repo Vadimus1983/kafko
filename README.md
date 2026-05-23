@@ -24,7 +24,7 @@ A single Rust crate providing:
 - **Compression** — none / lz4 / zstd, configured per topic
 - **Compaction** — key-based dedup of the active log (v0.2)
 - **Crash recovery** — CRC verification on read, torn-tail truncate on startup
-- **Async API on `tokio`** — `Producer::send().await` resolves only after the record is durably appended to the OS file
+- **Async API on `tokio`** — `Producer::send().await` resolves once the record is appended to the OS file (page cache); see [Durability](#durability) for the exact contract
 - **Single-writer-per-partition invariant** — no global mutex on the hot path
 
 The killer use case isn't "replace Kafka." It's **testing log-shaped application code in-process**: open a `Kafko` in the same test binary, call the produce/consume/seek APIs directly, and get offset-aware integration tests without containers, brokers, or flake.
@@ -109,6 +109,17 @@ One broker object, many cheap handles. Each partition has its own writer task th
        orders-0/ segments      payments-0/ segments
 ```
 
+## Durability
+
+kafko v0.1 provides the **same durability contract as Kafka with `acks=1`** — leader has the record in page cache, not necessarily on disk:
+
+- `Producer::send().await` resolves once the record has been written to the OS file via `write_all`. The bytes are in the **OS page cache**, owned by the kernel — they survive process crashes (panic, SIGKILL, OOM) because the process doesn't own them.
+- `Producer::send().await` does **not** fsync. Records may be lost if the OS crashes, the kernel panics, or the host loses power before automatic writeback (typically seconds on Linux / Windows).
+- Torn or partial writes at the tail of the active segment are detected and truncated on next startup via CRC scan; the sparse index is rebuilt from the verified segment.
+- For stricter guarantees, the partition exposes an explicit `sync()` you can call after `send`. A configurable per-call fsync policy (`EveryRecord` / `EveryBatch` / `EveryNms` / `Never`) is on the v0.2 roadmap.
+
+This contract is identical to what Kafka calls `acks=1` and is the *fair* comparison shape for the benchmarks below. If you need `acks=all`-style multi-replica durability, kafko is not the right tool — use Kafka.
+
 ## Benchmarks
 
 All numbers from a single machine, both systems running in Linux Docker containers, both load tests running **inside their respective containers** (`oha` inside the kafko container; `kafka-producer-perf-test.sh` inside the Kafka container). Container loopback only — no Windows TCP, no port forwarding. Reproducible from `scripts/kafko_docker_bench.ps1` and `scripts/kafka_bench_unbatched.ps1`.
@@ -119,10 +130,10 @@ Both systems configured to send **one record per network request** with 16 concu
 
 | | kafko | Kafka |
 |---|---|---|
-| Image | Debian slim + kafko_http + oha | `apache/kafka:3.7.0` + perf-test |
+| Image | Debian slim + `kafko-http` + oha | `apache/kafka:3.7.0` + perf-test |
 | Server config | axum 0.7 + kafko, port 9091 | KRaft single-node, 8 io/net threads, 16 MiB max msg, 1 GiB JVM heap |
 | Client config | oha, `-c 16`, one HTTP request per record | `linger.ms=0`, `batch.size=size+1024`, `max.in.flight=1`, `acks=1`, 16 parallel `kafka-producer-perf-test.sh` processes |
-| Durability | record in OS file at `send().await` resolution | `acks=1` — leader has appended to page cache |
+| Durability | record in OS page cache at `send().await` (same contract as Kafka `acks=1`) | `acks=1` — leader has appended to page cache |
 | Payload | all-zero bytes | all-zero bytes |
 | Compression codecs | none / lz4 / zstd (per-topic) | none / lz4 / zstd (`compression.type`) |
 
@@ -130,35 +141,40 @@ Both systems configured to send **one record per network request** with 16 concu
 
 | Size | kafko **none** | Kafka **none** | Δ | kafko **lz4** | Kafka **lz4** | Δ | kafko **zstd** | Kafka **zstd** | Δ |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 64 B    | **102,786** | 69,179 | 1.49× | **102,828** | 63,782 | 1.61× | **98,696** | 50,888 | 1.94× |
-| 256 B   | **102,294** | 39,791 | 2.57× | **105,551** | 36,941 | 2.86× | **93,268** | 29,068 | 3.21× |
-| 512 B   | **87,777**  | 32,059 | 2.74× | **102,598** | 25,409 | 4.04× | **95,384** | 19,007 | 5.02× |
-| 1 KiB   | **77,431**  | 22,001 | 3.52× | **101,841** | 19,975 | 5.10× | **97,153** | 14,539 | 6.68× |
-| 4 KiB   | **27,568**  | 7,025  | 3.92× | **94,154**  | 5,614  | 16.8× | **93,917** | 4,145  | 22.7× |
-| 1 MiB   | **1,818**   | 261    | 6.97× | **6,518**   | 242    | 26.9× | **4,758**  | 210    | 22.7× |
+| 64 B    | **106,638** | 64,555 | 1.65× | **102,819** | 66,806 | 1.54× | **99,986**  | 47,211 | 2.12× |
+| 256 B   | **101,513** | 39,537 | 2.57× | **105,016** | 37,918 | 2.77× | **102,030** | 27,791 | 3.67× |
+| 512 B   | **92,107**  | 30,973 | 2.97× | **104,222** | 26,526 | 3.93× | **96,380**  | 19,045 | 5.06× |
+| 1 KiB   | **76,754**  | 21,980 | 3.49× | **101,391** | 19,703 | 5.15× | **98,395**  | 14,564 | 6.76× |
+| 4 KiB   | **26,979**  | 6,916  | 3.90× | **97,632**  | 5,941  | 16.4× | **95,316**  | 4,125  | 23.1× |
+| 128 KiB | **8,480**   | n/a¹   | n/a   | **27,698**  | n/a¹   | n/a   | **31,493**  | n/a¹   | n/a   |
+| 1 MiB   | **1,770**   | 256    | 6.91× | **6,199**   | 238    | 26.0× | **4,848**   | 215    | 22.5× |
 
-kafko wins every cell. At small records, the win is 1.5-3×; at large records with compression, it grows to **22-27×**.
+¹ The 128 KiB cell was added to `kafka_bench_unbatched.ps1` after its most recent run; rerun that script to populate the Kafka column at 128 KiB. (Why 128 KiB? It's Kafka's default `batch.size`, so the cell asks: what does kafko do when it's sending the same payload size Kafka would naturally pack into one batched network call?)
+
+kafko wins every apples-to-apples cell. At small records, the win is 1.5-3×; at large records with compression, it grows to **22-26×**.
 
 ### Payload throughput — MiB/s committed
 
 | Size | kafko none | Kafka none | kafko lz4 | Kafka lz4 | kafko zstd | Kafka zstd |
 |---|---:|---:|---:|---:|---:|---:|
-| 64 B    | 6.3   | 4.2  | 6.3   | 3.9  | 6.0   | 3.1  |
-| 256 B   | 25.0  | 9.7  | 25.8  | 9.0  | 22.8  | 7.1  |
-| 1 KiB   | 75.6  | 21.5 | 99.5  | 19.5 | 94.9  | 14.2 |
-| 4 KiB   | 107.7 | 27.4 | **367.8** | 21.9 | **366.9** | 16.2 |
-| **1 MiB** | **1818** | 261 | **6518** | 242 | **4758** | 210 |
+| 64 B    | 6.5   | 3.9  | 6.3   | 4.1  | 6.1   | 2.9  |
+| 256 B   | 24.8  | 9.7  | 25.6  | 9.3  | 24.9  | 6.8  |
+| 1 KiB   | 75.0  | 21.5 | 99.0  | 19.2 | 96.1  | 14.2 |
+| 4 KiB   | 105.4 | 27.0 | **381.4** | 23.2 | **372.3** | 16.1 |
+| 128 KiB | **1,060** | n/a¹ | **3,462** | n/a¹ | **3,937** | n/a¹ |
+| **1 MiB** | **1,770** | 256 | **6,199** | 238 | **4,848** | 215 |
 
-### Latency — p50 (median)
+### Latency — p50 (median, codec = none)
 
 | Size | kafko p50 | Kafka p50 |
 |---|---:|---:|
-| 64 B    | **0.15 ms** | 2,834 ms |
-| 256 B   | **0.15 ms** | 5,605 ms |
-| 512 B   | **0.17 ms** | 9,758 ms |
-| 1 KiB   | **0.20 ms** | 12,171 ms |
-| 4 KiB   | **0.57 ms** | 2,069 ms |
-| 1 MiB   | **9.1 ms**  | 404 ms |
+| 64 B    | **0.14 ms** | 3,079 ms |
+| 256 B   | **0.15 ms** | 5,549 ms |
+| 512 B   | **0.16 ms** | 9,086 ms |
+| 1 KiB   | **0.20 ms** | 12,386 ms |
+| 4 KiB   | **0.58 ms** | 2,155 ms |
+| 128 KiB | **1.86 ms** | n/a¹ |
+| 1 MiB   | **8.94 ms** | 424 ms |
 
 The Kafka latency values are dominated by **client-side queue saturation**: with `max.in.flight=1` and `linger.ms=0`, the Java producer cannot avoid pile-up when records arrive faster than the broker can ack one-at-a-time. kafko's `oha` is strictly synchronous per connection (send → wait → receive → next), so its p50 is honest HTTP round-trip time. This is exactly the "Kafka assumes you batch" story — without batching, **Kafka's producer-side architecture forces queueing that kafko's simpler request-response shape sidesteps.**
 
@@ -175,11 +191,11 @@ Once kafko gains a `send_batch` API (planned, v0.2), the expectation is that it 
 - Single partition per topic
 - Single consumer per topic
 - File-based segments with CRC32 integrity
-- Crash recovery on startup (torn-tail truncate)
+- Crash recovery on startup (torn-tail truncate, sparse index rebuild)
 - Time- and size-based retention
 - Producer + Consumer async API on `tokio`
 - Per-topic compression (none / lz4 / zstd)
-- HTTP server adapter (`--features http-server`) for testing/benchmarking
+- `kafko-http` — a separate workspace crate (`crates/kafko-http/`) exposing the broker over HTTP for integration testing and benchmarking
 
 ## v0.2 — roadmap
 
@@ -199,23 +215,31 @@ Once kafko gains a `send_batch` API (planned, v0.2), the expectation is that it 
 
 ## Building and benchmarking
 
-```bash
-# Standard build
-cargo build --release
+This is a Cargo workspace. The library crate is `crates/kafko/` (publishable to crates.io); the HTTP test harness is `crates/kafko-http/` (`publish = false`).
 
-# Build with the HTTP server binary
-cargo build --release --bin kafko_http --features http-server
+```bash
+# Workspace check (lib + http harness + tests + benches)
+cargo check --workspace --all-targets
+
+# Build only the library
+cargo build --release --package kafko
+
+# Build the HTTP test harness binary
+cargo build --release --package kafko-http
+#   → target/release/kafko-http(.exe)
 
 # Run all tests
-cargo test --all-features
+cargo test --workspace
 
 # Run kafko storage benchmarks
-cargo bench
+cargo bench --package kafko
 
 # Reproduce the apples-to-apples Kafka comparison (Windows PowerShell)
 .\scripts\kafko_docker_bench.ps1
 .\scripts\kafka_bench_unbatched.ps1
 ```
+
+See [`scripts/README.md`](scripts/README.md) for the full bench script catalogue (default Kafka, max-tuned Kafka, apples-to-apples, host-side kafko, Docker-side kafko).
 
 ## License
 

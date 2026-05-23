@@ -129,14 +129,7 @@ impl Log {
             .would_overflow(wire_size_estimate, self.config.segment_size_threshold);
 
         if should_rotate {
-            let new_segment = Segment::create(&self.dir, self.next_offset).await?;
-            let new_index =
-                SparseIndex::create(&self.dir, self.next_offset, self.config.index_interval)
-                    .await?;
-            self.segments.push(IndexedSegment {
-                segment: new_segment,
-                index: new_index,
-            });
+            self.rotate_active_segment().await?;
         }
 
         let mut buf = BytesMut::with_capacity(wire_size_estimate);
@@ -177,14 +170,7 @@ impl Log {
             .segment
             .would_overflow(total_wire_size, self.config.segment_size_threshold);
         if should_rotate {
-            let new_segment = Segment::create(&self.dir, self.next_offset).await?;
-            let new_index =
-                SparseIndex::create(&self.dir, self.next_offset, self.config.index_interval)
-                    .await?;
-            self.segments.push(IndexedSegment {
-                segment: new_segment,
-                index: new_index,
-            });
+            self.rotate_active_segment().await?;
         }
 
         let compression = self.config.compression;
@@ -288,6 +274,31 @@ impl Log {
         }
 
         Ok(deleted)
+    }
+
+    /// Seals the active segment and creates a fresh one. The previous segment's
+    /// `.log` and `.index` files are fsynced BEFORE the new segment exists.
+    ///
+    /// This closes a data-loss window: recovery on `Log::open` only re-verifies the
+    /// last segment via CRC scan; older sealed segments are trusted. If we rotated
+    /// without first flushing the previous segment, a power loss between rotation
+    /// and the OS's automatic writeback could leave the sealed segment with an
+    /// unrecoverable truncated tail — and recovery wouldn't notice. Offset numbering
+    /// would silently skip records that were already acked to the producer.
+    async fn rotate_active_segment(&mut self) -> Result<()> {
+        {
+            let active = self.segments.last_mut().expect("segments invariant: never empty after create");
+            active.segment.sync().await?;
+            active.index.sync().await?;
+        }
+        let new_segment = Segment::create(&self.dir, self.next_offset).await?;
+        let new_index =
+            SparseIndex::create(&self.dir, self.next_offset, self.config.index_interval).await?;
+        self.segments.push(IndexedSegment {
+            segment: new_segment,
+            index: new_index,
+        });
+        Ok(())
     }
 
     async fn delete_oldest_segment(&mut self) -> Result<()> {

@@ -24,7 +24,7 @@ A single Rust crate providing:
 - **Compression** — none / lz4 / zstd, configured per topic
 - **Compaction** — key-based dedup of the active log (v0.2)
 - **Crash recovery** — CRC verification on read, torn-tail truncate on startup
-- **Async API on `tokio`** — `Producer::send().await` resolves only after the record is durably appended to the OS file
+- **Async API on `tokio`** — `Producer::send().await` resolves once the record is appended to the OS file (page cache); see [Durability](#durability) for the exact contract
 - **Single-writer-per-partition invariant** — no global mutex on the hot path
 
 The killer use case isn't "replace Kafka." It's **testing log-shaped application code in-process**: open a `Kafko` in the same test binary, call the produce/consume/seek APIs directly, and get offset-aware integration tests without containers, brokers, or flake.
@@ -82,6 +82,17 @@ broker
     )
     .await?;
 ```
+
+## Durability
+
+kafko v0.1 provides the **same durability contract as Kafka with `acks=1`** — leader has the record in page cache, not necessarily on disk:
+
+- `Producer::send().await` resolves once the record has been written to the OS file via `write_all`. The bytes are in the **OS page cache**, owned by the kernel — they survive process crashes (panic, SIGKILL, OOM) because the process doesn't own them.
+- `Producer::send().await` does **not** fsync. Records may be lost if the OS crashes, the kernel panics, or the host loses power before automatic writeback (typically seconds on Linux / Windows).
+- Torn or partial writes at the tail of the active segment are detected and truncated on next startup via CRC scan; the sparse index is rebuilt from the verified segment.
+- For stricter guarantees, the partition exposes an explicit `sync()` you can call after `send`. A configurable per-call fsync policy (`EveryRecord` / `EveryBatch` / `EveryNms` / `Never`) is on the v0.2 roadmap.
+
+If you need `acks=all`-style multi-replica durability, kafko is not the right tool — use Kafka.
 
 ## Architecture
 

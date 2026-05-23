@@ -194,3 +194,50 @@ async fn recovery_is_idempotent() {
         assert_eq!(log.total_size(), total_size_first);
     }
 }
+
+/// Recovery only re-verifies the active (last) segment, so an unflushed tail on
+/// a sealed segment would be silently lost on a power-loss between rotation and
+/// OS writeback. Every record, including those on segments that were sealed by
+/// rotation, must be readable after reopening the log.
+#[tokio::test]
+async fn rotation_preserves_records_on_sealed_segments() {
+    let dir = TempDir::new().unwrap();
+
+    // Tight segment threshold so a handful of records forces several rotations.
+    let cfg = LogConfig {
+        segment_size_threshold: 256,
+        ..LogConfig::default()
+    };
+
+    let record_count = 64u64;
+    let total_expected: u64;
+    {
+        let mut log = Log::open(dir.path(), cfg).await.unwrap();
+        for i in 0..record_count {
+            log.append(record(i)).await.unwrap();
+        }
+        // We expect rotation to have happened multiple times.
+        assert!(
+            log.segment_count() > 1,
+            "expected multiple segments to exercise rotation; got {}",
+            log.segment_count()
+        );
+        total_expected = log.total_size();
+    }
+
+    let mut log = Log::open(dir.path(), cfg).await.unwrap();
+    assert_eq!(log.next_offset(), record_count);
+    assert_eq!(log.total_size(), total_expected);
+
+    for i in 0..record_count {
+        let r = log.read_record_at(i).await.unwrap().unwrap_or_else(|| {
+            panic!("record at offset {i} missing after reopen — rotation lost data")
+        });
+        let expected_value = format!("value-{i}");
+        assert_eq!(
+            r.value().as_ref(),
+            expected_value.as_bytes(),
+            "record {i} value differs after reopen — corruption across rotation"
+        );
+    }
+}
