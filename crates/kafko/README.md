@@ -92,6 +92,22 @@ kafko v0.1 provides the **same durability contract as Kafka with `acks=1`** — 
 - Torn or partial writes at the tail of the active segment are detected and truncated on next startup via CRC scan; the sparse index is rebuilt from the verified segment.
 - For stricter guarantees, the partition exposes an explicit `sync()` you can call after `send`. A configurable per-call fsync policy (`EveryRecord` / `EveryBatch` / `EveryNms` / `Never`) is on the v0.2 roadmap.
 
+### Graceful shutdown
+
+`Kafko::shutdown().await` is a real durability boundary: every partition's writer task drains its inbox, fsyncs the active segment, and exits before the call returns. Any record that was acked to a producer before `shutdown` was called is on disk by the time `shutdown` resolves.
+
+Host applications that care about durability across `SIGTERM` / `SIGINT` / `docker stop` should install a signal handler that drives `shutdown().await` to completion before exiting:
+
+```rust,no_run
+# async fn run(broker: kafko::Kafko) -> kafko::Result<()> {
+tokio::signal::ctrl_c().await.ok();
+broker.shutdown().await?;
+# Ok(())
+# }
+```
+
+`SIGKILL`, OS panic, and power loss bypass userspace and cannot be intercepted; the recovery path on the next `Kafko::open` handles torn tails via CRC scan, but any record whose page-cache bytes had not yet been written back by the kernel may be lost. Letting the broker drop without calling `shutdown` releases the data-directory lock but does NOT guarantee a final fsync.
+
 If you need `acks=all`-style multi-replica durability, kafko is not the right tool — use Kafka.
 
 ## Architecture

@@ -119,6 +119,13 @@ async fn partition_writer_loop(
             }
         }
     }
+
+    // The inbox is closed (Partition::shutdown was called or Partition was dropped).
+    // Flush every previously-acked record from OS page cache to disk before exiting.
+    // This is what makes Kafko::shutdown().await a true durability boundary: after
+    // it returns, every record this writer ever acked is fsynced. Errors here are
+    // silently ignored — the task is unwinding and there is no caller to report to.
+    let _ = log.sync().await;
 }
 
 // When the first command of a wake-up is an Append, drain any other ready Appends

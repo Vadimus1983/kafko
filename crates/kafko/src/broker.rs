@@ -134,6 +134,22 @@ impl Kafko {
         Ok(Consumer::from_partition(partition))
     }
 
+    /// Gracefully closes the broker. Every partition's writer task drains its
+    /// inbox, fsyncs the active segment, and exits. The data-directory lock is
+    /// released last. Returns only after every previously-acked record is on
+    /// disk and not just in OS page cache.
+    ///
+    /// Host applications that care about durability across `SIGTERM` / `SIGINT`
+    /// / `docker stop` should install a signal handler that drives this method
+    /// to completion before the process exits. `SIGKILL`, OS panic, and power
+    /// loss bypass userspace entirely and cannot be intercepted; for those
+    /// cases the recovery path at next `Kafko::open` handles torn writes via
+    /// CRC scan, but any record whose page-cache bytes had not yet been
+    /// flushed by the kernel may be lost.
+    ///
+    /// Letting the broker simply go out of scope (no `shutdown().await`)
+    /// releases the lock but does NOT guarantee that recently-acked records
+    /// are fsynced — the writer tasks are aborted by tokio runtime shutdown.
     pub async fn shutdown(self) -> Result<()> {
         let topics = self.topics.into_inner();
         for (_, partition) in topics {
