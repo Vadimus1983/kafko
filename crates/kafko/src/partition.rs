@@ -2,6 +2,7 @@ use crate::error::{KafkoError, Result};
 use crate::log::{Log, LogConfig};
 use crate::record::Record;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -10,7 +11,13 @@ const INBOX_CAPACITY: usize = 1024;
 pub struct Partition {
     inbox: mpsc::Sender<PartitionCommand>,
     hwm_rx: watch::Receiver<u64>,
-    task: JoinHandle<()>,
+    // Set once by the supervisor if the writer task exits via panic. None for clean shutdowns.
+    panic_info: Arc<OnceLock<String>>,
+    // Flips to true exactly once when the supervisor has observed the writer's termination
+    // (clean or panic). Lets every method that fails to communicate with the writer wait
+    // for the post-mortem result without busy-spinning.
+    writer_done_rx: watch::Receiver<bool>,
+    supervisor: JoinHandle<()>,
 }
 
 enum PartitionCommand {
@@ -25,6 +32,9 @@ enum PartitionCommand {
     Sync {
         reply: oneshot::Sender<Result<()>>,
     },
+    // Forces the writer task to panic. Reachable only via Partition::poison_for_test
+    // (doc-hidden test seam); not exposed in any public producer or consumer API.
+    Poison,
 }
 
 impl Partition {
@@ -33,45 +43,88 @@ impl Partition {
         let initial_hwm = log.next_offset();
         let (inbox_tx, inbox_rx) = mpsc::channel(INBOX_CAPACITY);
         let (hwm_tx, hwm_rx) = watch::channel(initial_hwm);
-        let task = tokio::spawn(partition_writer_loop(log, inbox_rx, hwm_tx));
+
+        let writer_handle = tokio::spawn(partition_writer_loop(log, inbox_rx, hwm_tx));
+
+        let panic_info = Arc::new(OnceLock::new());
+        let (done_tx, writer_done_rx) = watch::channel(false);
+
+        let panic_info_clone = panic_info.clone();
+        let supervisor = tokio::spawn(async move {
+            match writer_handle.await {
+                Ok(()) => {}
+                Err(join_err) if join_err.is_panic() => {
+                    let s = panic_payload_to_string(join_err.into_panic());
+                    let _ = panic_info_clone.set(s);
+                }
+                Err(_) => {
+                    // Cancelled by runtime shutdown; treated as clean for the caller.
+                }
+            }
+            let _ = done_tx.send(true);
+        });
+
         Ok(Self {
             inbox: inbox_tx,
             hwm_rx,
-            task,
+            panic_info,
+            writer_done_rx,
+            supervisor,
         })
     }
 
     pub async fn append(&self, record: Record) -> Result<u64> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.inbox
+        if self
+            .inbox
             .send(PartitionCommand::Append {
                 record,
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| KafkoError::Closed)?;
-        reply_rx.await.map_err(|_| KafkoError::Closed)?
+            .is_err()
+        {
+            return Err(self.writer_death_error().await);
+        }
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(self.writer_death_error().await),
+        }
     }
 
     pub async fn read_record_at(&self, offset: u64) -> Result<Option<Record>> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.inbox
+        if self
+            .inbox
             .send(PartitionCommand::ReadAt {
                 offset,
                 reply: reply_tx,
             })
             .await
-            .map_err(|_| KafkoError::Closed)?;
-        reply_rx.await.map_err(|_| KafkoError::Closed)?
+            .is_err()
+        {
+            return Err(self.writer_death_error().await);
+        }
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(self.writer_death_error().await),
+        }
     }
 
     pub async fn sync(&self) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.inbox
+        if self
+            .inbox
             .send(PartitionCommand::Sync { reply: reply_tx })
             .await
-            .map_err(|_| KafkoError::Closed)?;
-        reply_rx.await.map_err(|_| KafkoError::Closed)?
+            .is_err()
+        {
+            return Err(self.writer_death_error().await);
+        }
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(self.writer_death_error().await),
+        }
     }
 
     pub fn high_water_mark(&self) -> u64 {
@@ -82,11 +135,61 @@ impl Partition {
         self.hwm_rx.clone()
     }
 
-    pub async fn shutdown(self) -> Result<()> {
-        drop(self.inbox);
-        self.task.await.map_err(|_| KafkoError::Closed)?;
+    /// Resolves once the writer task has actually terminated. Returns
+    /// `PartitionPanicked { payload }` if the termination was a panic, otherwise
+    /// `Closed`. Waits on a watch channel populated by the supervisor task, so
+    /// there is no busy-spin and no risk of returning `Closed` while the
+    /// post-mortem is still in flight.
+    async fn writer_death_error(&self) -> KafkoError {
+        let mut rx = self.writer_done_rx.clone();
+        loop {
+            if *rx.borrow() {
+                break;
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+        match self.panic_info.get() {
+            Some(payload) => KafkoError::PartitionPanicked {
+                payload: payload.clone(),
+            },
+            None => KafkoError::Closed,
+        }
+    }
+
+    /// Test-only escape hatch that forces the writer task to panic. Used by
+    /// integration tests to verify that subsequent calls surface
+    /// `KafkoError::PartitionPanicked` rather than the generic `Closed`. Not
+    /// intended for production code.
+    #[doc(hidden)]
+    pub async fn poison_for_test(&self) -> Result<()> {
+        self.inbox
+            .send(PartitionCommand::Poison)
+            .await
+            .map_err(|_| KafkoError::Closed)?;
         Ok(())
     }
+
+    pub async fn shutdown(self) -> Result<()> {
+        drop(self.inbox);
+        // Awaiting the supervisor instead of the writer task directly: the
+        // supervisor finishes only after observing the writer's termination, so
+        // by the time this returns the final-fsync done inside the writer loop
+        // is complete and the panic-capture (if any) has been recorded.
+        self.supervisor.await.map_err(|_| KafkoError::Closed)?;
+        Ok(())
+    }
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "panic with non-string payload".to_string()
 }
 
 async fn partition_writer_loop(
@@ -215,6 +318,9 @@ async fn handle_single_command(log: &mut Log, hwm_tx: &watch::Sender<u64>, cmd: 
         PartitionCommand::Sync { reply } => {
             let result = log.sync().await;
             let _ = reply.send(result);
+        }
+        PartitionCommand::Poison => {
+            panic!("intentional panic from poison command (test-only)");
         }
     }
 }

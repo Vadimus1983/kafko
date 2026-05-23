@@ -37,4 +37,7 @@ pub enum KafkoError {
 
     #[error("data directory {} is already opened by another Kafko instance (file lock held)", .path.display())]
     AlreadyOpen { path: PathBuf },
+
+    #[error("partition writer task panicked: {payload}")]
+    PartitionPanicked { payload: String },
 }

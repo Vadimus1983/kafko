@@ -176,3 +176,44 @@ async fn operations_after_shutdown_return_closed() {
     p.append(record(0)).await.unwrap();
     p.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn writer_panic_surfaces_as_partition_panicked_to_subsequent_callers() {
+    use kafko::KafkoError;
+
+    let dir = TempDir::new().unwrap();
+    let p = Partition::open(dir.path(), LogConfig::default())
+        .await
+        .unwrap();
+
+    // Confirm the partition is live before we poison it.
+    assert_eq!(p.append(record(0)).await.unwrap(), 0);
+
+    p.poison_for_test().await.unwrap();
+
+    // From here on, every method must surface the panic instead of the generic
+    // Closed. The supervisor task observes the writer's panic and the awaiting
+    // call inside writer_death_error blocks until it does, so this is not a race.
+    match p.append(record(1)).await {
+        Err(KafkoError::PartitionPanicked { payload }) => {
+            assert!(
+                payload.contains("intentional panic"),
+                "panic payload didn't preserve the message: {payload}"
+            );
+        }
+        Err(e) => panic!("expected PartitionPanicked, got {:?}", e),
+        Ok(_) => panic!("expected PartitionPanicked, got Ok"),
+    }
+
+    // Reads see the same error so callers can tell the partition is unusable
+    // regardless of which method they invoke.
+    match p.read_record_at(0).await {
+        Err(KafkoError::PartitionPanicked { .. }) => {}
+        other => panic!("expected PartitionPanicked from read_record_at, got {:?}", other),
+    }
+    match p.sync().await {
+        Err(KafkoError::PartitionPanicked { .. }) => {}
+        other => panic!("expected PartitionPanicked from sync, got {:?}", other),
+    }
+}
+
