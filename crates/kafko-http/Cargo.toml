@@ -1,0 +1,13 @@
+[package]
+name = "kafko-http"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "HTTP test harness for kafko: single-partition, three-codec topology behind axum."
+
+[dependencies]
+kafko = { path = "../kafko" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+axum = "0.7"
+anyhow = "1"
+bytes = "1"

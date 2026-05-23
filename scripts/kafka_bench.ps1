@@ -8,22 +8,40 @@
 #   - Windows PowerShell 5.1+ (Pwsh 7 also works)
 #
 # Output:
-#   kafka_bench_results.txt in the current directory
+#   scripts/tmp/kafka_bench_results_<YYYYMMDD-HHMMSS>.txt
 #
 # Matrix:
 #   4 modes × 6 record sizes = 24 measurements, ~15-20 minutes total.
+#
+# Config notes:
+#   Every Kafka knob except message-size ceilings is left at its default. The
+#   message-size knobs (broker message.max.bytes, topic max.message.bytes,
+#   producer max.request.size) are all raised to 16 MiB so the 1 MiB record
+#   cell does not fail. With defaults (~1 MiB on each), a 1 MiB record serializes
+#   to ~1,048,664 bytes (record + framing) and the producer rejects it with
+#   RecordTooLargeException. Raising these three to 16 MiB does NOT add any
+#   batching or tuning -- it just lifts the size ceiling.
 
 # NOTE: PowerShell 5.1 wraps stderr from native commands as NativeCommandError
 # when redirected (e.g., `2>$null`). With $ErrorActionPreference='Stop' this halts
 # the script. We use `cmd /c "cmd >nul 2>nul"` for silenced calls instead -- cmd
 # handles the redirect, PowerShell only sees the exit code.
 
+# --- Anchor every path to the script's own location ---
+$ScriptDir   = $PSScriptRoot
+$ProjectRoot = (Resolve-Path (Join-Path $ScriptDir '..')).Path
+$TmpDir      = Join-Path $ScriptDir 'tmp'
+New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+Push-Location $ProjectRoot
+try {
+
 # --- Config ---
 $KafkaImage = 'apache/kafka:3.7.0'
 $Container  = 'kafka-bench'
 $Topic      = 'bench'
 $Sizes      = @(64, 256, 512, 1024, 4096, 1048576)
-$Results    = 'kafka_bench_results.txt'
+$Timestamp  = (Get-Date).ToString('yyyyMMdd-HHmmss')
+$Results    = Join-Path $TmpDir "kafka_bench_results_$Timestamp.txt"
 $ClusterId  = 'ciWo7IWazngRchmPES6q5A'
 
 # --- Cleanup helper ---
@@ -65,6 +83,10 @@ $startArgs = @(
     '-e', 'KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT',
     '-e', 'KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093',
     '-e', "CLUSTER_ID=$ClusterId",
+    # Raise broker-side message-size ceilings to 16 MiB so the 1 MiB cell works.
+    # Defaults (~1 MiB) reject 1 MiB records once framing overhead is added.
+    '-e', 'KAFKA_MESSAGE_MAX_BYTES=16777216',
+    '-e', 'KAFKA_REPLICA_FETCH_MAX_BYTES=16777216',
     $KafkaImage
 )
 
@@ -143,12 +165,14 @@ function Invoke-PerfRun {
     cmd /c "docker exec $Container /opt/kafka/bin/kafka-topics.sh --delete --topic $Topic --bootstrap-server localhost:9092 >nul 2>nul"
     Start-Sleep -Seconds 1
 
-    # Create fresh topic (let output show if it fails)
+    # Create fresh topic with raised max.message.bytes so the 1 MiB cell works
     & docker exec $Container /opt/kafka/bin/kafka-topics.sh `
         --create --topic $Topic --partitions 1 --replication-factor 1 `
+        --config "max.message.bytes=16777216" `
         --bootstrap-server localhost:9092 | Out-Null
 
-    # Run the perf test
+    # Run the perf test. max.request.size raised to 16 MiB so the producer
+    # accepts records >1 MiB after framing overhead is added.
     $perfArgs = @(
         'exec', $Container,
         '/opt/kafka/bin/kafka-producer-perf-test.sh',
@@ -161,7 +185,8 @@ function Invoke-PerfRun {
         'acks=1',
         "linger.ms=$linger",
         "batch.size=$batchSize",
-        "compression.type=$compression"
+        "compression.type=$compression",
+        'max.request.size=16777216'
     )
 
     $output = & docker @perfArgs
@@ -188,3 +213,7 @@ Add-Content -Path $Results -Value ""
 Add-Content -Path $Results -Value "=== DONE -- results in $Results ==="
 Write-Host ""
 Write-Host "=== DONE -- results in $Results ==="
+
+} finally {
+    Pop-Location
+}

@@ -9,19 +9,27 @@
 #   - Internet (first run pulls apache/kafka image, ~400 MB)
 #
 # Output:
-#   kafka_bench_results.txt in the current directory
+#   scripts/tmp/kafka_bench_results_<YYYYMMDD-HHMMSS>.txt
 #
 # Matrix:
 #   4 modes × 6 record sizes = 24 measurements, ~15-20 minutes total.
 
 set -euo pipefail
 
+# ─── Anchor every path to the script's own location ─────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+TMP_DIR="${SCRIPT_DIR}/tmp"
+mkdir -p "$TMP_DIR"
+cd "$PROJECT_ROOT"
+
 # ─── Config ──────────────────────────────────────────────────────────────────
 KAFKA_IMAGE="apache/kafka:3.7.0"
 CONTAINER="kafka-bench"
 TOPIC="bench"
 SIZES=(64 256 512 1024 4096 1048576)
-RESULTS="kafka_bench_results.txt"
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+RESULTS="${TMP_DIR}/kafka_bench_results_${TIMESTAMP}.txt"
 CLUSTER_ID="ciWo7IWazngRchmPES6q5A"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────

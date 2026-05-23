@@ -15,7 +15,7 @@
 # sent one record per request. This script removes that advantage so the
 # comparison is purely "protocol overhead per record" for each system.
 #
-# Output: kafka_bench_unbatched_results.txt
+# Output: scripts/tmp/kafka_bench_unbatched_results_<YYYYMMDD-HHMMSS>.txt
 # Usage:  .\scripts\kafka_bench_unbatched.ps1
 # Time:   ~12-15 minutes
 
@@ -23,14 +23,28 @@
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding           = [System.Text.Encoding]::UTF8
 
+# --- Anchor every path to the script's own location ---
+$ScriptDir   = $PSScriptRoot
+$ProjectRoot = (Resolve-Path (Join-Path $ScriptDir '..')).Path
+$TmpDir      = Join-Path $ScriptDir 'tmp'
+New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+Push-Location $ProjectRoot
+try {
+
 # --- Config ---
+#
+# $Sizes includes 131072 (128 KiB) to match kafko_docker_bench.ps1's new cell.
+# At 128 KiB, Kafka's max-tuned default batch.size = 128 KiB holds exactly one
+# record per batch, so the unbatched-vs-batched distinction collapses and the
+# only thing being measured is wire+storage cost per network call.
 $KafkaImage    = 'apache/kafka:3.7.0'
 $Container     = 'kafka-bench-unbatched'
 $Topic         = 'bench'
-$Sizes         = @(64, 256, 512, 1024, 4096, 1048576)
+$Sizes         = @(64, 256, 512, 1024, 4096, 131072, 1048576)
 $Codecs        = @('none', 'lz4', 'zstd')
 $NumProducers  = 16
-$ResultsFile   = 'kafka_bench_unbatched_results.txt'
+$Timestamp     = (Get-Date).ToString('yyyyMMdd-HHmmss')
+$ResultsFile   = Join-Path $TmpDir "kafka_bench_unbatched_results_$Timestamp.txt"
 $ClusterId     = 'ciWo7IWazngRchmPES6q5A'
 
 # --- Cleanup helper ---
@@ -90,6 +104,12 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
+# From this point, ANY failure must clean up the container. Wrap the rest in
+# a single try/finally so neither readiness checks nor StreamWriter construction
+# can leak a running container.
+$writer = $null
+try {
+
 # --- Wait for Kafka to be ready (up to 90s) ---
 Write-Host -NoNewline "Waiting for Kafka to become ready"
 $ready = $false
@@ -107,15 +127,13 @@ if (-not $ready) {
     Write-Host " FAILED" -ForegroundColor Red
     Write-Host "Kafka did not become ready in 90s. Last 50 log lines:"
     & docker logs --tail 50 $Container
-    Invoke-Cleanup
-    exit 1
+    throw "Kafka did not become ready in time"
 }
 
 # --- Open results file via StreamWriter (UTF-8 no BOM, held open) ---
-$resultsAbsPath = Join-Path (Get-Location) $ResultsFile
-if (Test-Path $resultsAbsPath) { Remove-Item -Path $resultsAbsPath -Force }
+if (Test-Path $ResultsFile) { Remove-Item -Path $ResultsFile -Force }
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-$writer = [System.IO.StreamWriter]::new($resultsAbsPath, $false, $utf8NoBom)
+$writer = [System.IO.StreamWriter]::new($ResultsFile, $false, $utf8NoBom)
 $writer.AutoFlush = $true
 
 function Write-Result {
@@ -138,6 +156,7 @@ function Invoke-UnbatchedConcurrentRun {
     param([int]$Size, [string]$Compression)
 
     if     ($Size -ge 1048576) { $totalTarget = 1000   }
+    elseif ($Size -ge 131072)  { $totalTarget = 5000   }   # 128 KiB tier (Kafka batch-equivalent payload)
     elseif ($Size -ge 4096)    { $totalTarget = 50000  }
     else                       { $totalTarget = 500000 }
 
@@ -268,24 +287,30 @@ rm -f /tmp/perf-*.log
 }
 
 # --- Matrix: 3 codecs x 6 sizes = 18 runs ---
-try {
-    foreach ($codec in $Codecs) {
-        Write-Host ""
-        Write-Host ("=" * 60) -ForegroundColor Yellow
-        Write-Host " CODEC: $codec" -ForegroundColor Yellow
-        Write-Host ("=" * 60) -ForegroundColor Yellow
+foreach ($codec in $Codecs) {
+    Write-Host ""
+    Write-Host ("=" * 60) -ForegroundColor Yellow
+    Write-Host " CODEC: $codec" -ForegroundColor Yellow
+    Write-Host ("=" * 60) -ForegroundColor Yellow
 
-        foreach ($size in $Sizes) {
-            Invoke-UnbatchedConcurrentRun -Size $size -Compression $codec
-        }
+    foreach ($size in $Sizes) {
+        Invoke-UnbatchedConcurrentRun -Size $size -Compression $codec
     }
+}
+
+Write-Result ""
+Write-Result "=== DONE -- results in $ResultsFile ==="
+
 } finally {
-    Write-Result ""
-    Write-Result "=== DONE -- results in $ResultsFile ==="
-    $writer.Close()
-    $writer.Dispose()
+    if ($writer) {
+        try { $writer.Close(); $writer.Dispose() } catch {}
+    }
     Invoke-Cleanup
 }
 
 Write-Host ""
 Write-Host "=== DONE -- results in $ResultsFile ===" -ForegroundColor Green
+
+} finally {
+    Pop-Location
+}

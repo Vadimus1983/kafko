@@ -1,0 +1,19 @@
+# Keep the build context small + reproducible
+target/
+.git/
+.github/
+.idea/
+.vscode/
+
+# Local bench / log droppings
+kafko_data/
+kafko-http_data/
+bench_payloads/
+*.log
+*.err
+*.txt
+*.md
+
+# Editor leftovers
+*.swp
+*.bak

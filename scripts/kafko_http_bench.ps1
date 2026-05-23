@@ -1,21 +1,26 @@
-# kafko_http_bench.ps1 -- Load-test the kafko HTTP server with oha across 3 codecs.
+# kafko_http_bench.ps1 -- Load-test the kafko-http server with oha across 3 codecs.
 #
-# Usage (from project root, in PowerShell):
+# Usage (from anywhere, in PowerShell):
 #   .\scripts\kafko_http_bench.ps1
+#   pwsh /path/to/repo/scripts/kafko_http_bench.ps1   (also fine from any cwd)
+#
+# The script resolves all paths relative to its own location ($PSScriptRoot),
+# so the project root is always $PSScriptRoot\.. -- not whatever cwd the user
+# happened to be in when they typed the command.
 #
 # Requirements:
 #   - Rust toolchain (cargo)
 #   - oha installed: cargo install oha
 #
 # Output:
-#   kafko_http_bench_results.txt in the current directory
+#   scripts/tmp/kafko-http_bench_results_<YYYYMMDD-HHMMSS>.txt  (persistent)
 #
-# What it does:
-#   1. Builds kafko_http binary in release mode with http-server feature
-#   2. Generates all-zero payload files (same shape as Kafka bench)
-#   3. Starts kafko_http server (3 topics: bench_none / bench_lz4 / bench_zstd)
-#   4. Runs oha against POST /produce/:codec for each codec x size
-#   5. Stops the server, cleans up
+# Ephemeral run folder (created at start, removed at end):
+#   scripts/tmp/run_<YYYYMMDD-HHMMSS>/
+#     kafko-http_data/   server WAL + segments
+#     payloads/          oha payload .bin files
+#     server.log         kafko-http stdout
+#     server.err         kafko-http stderr
 #
 # Encoding notes (Windows PowerShell 5.1):
 #   - We set [Console]::OutputEncoding to UTF-8 so that bytes printed by `oha`
@@ -29,14 +34,45 @@
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding           = [System.Text.Encoding]::UTF8
 
+# --- Anchor every path to the script's own location ---
+$ScriptDir   = $PSScriptRoot
+$ProjectRoot = (Resolve-Path (Join-Path $ScriptDir '..')).Path
+$TmpDir      = Join-Path $ScriptDir 'tmp'
+New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+
+Push-Location $ProjectRoot
+try {
+
 $Sizes        = @(64, 256, 512, 1024, 4096, 1048576)
 $Codecs       = @('none', 'lz4', 'zstd')
 $Concurrency  = 16
-$ResultsFile  = 'kafko_http_bench_results.txt'
+$Timestamp    = (Get-Date).ToString('yyyyMMdd-HHmmss')
+$ResultsFile  = Join-Path $TmpDir "kafko-http_bench_results_$Timestamp.txt"
+$RunFolder    = Join-Path $TmpDir "run_$Timestamp"
+$PayloadDir   = Join-Path $RunFolder 'payloads'
+$DataDir      = Join-Path $RunFolder 'kafko-http_data'
+$ServerLogOut = Join-Path $RunFolder 'server.log'
+$ServerLogErr = Join-Path $RunFolder 'server.err'
 $ServerUrl    = 'http://127.0.0.1:9091'
-$PayloadDir   = 'bench_payloads'
-$ServerLogOut = 'kafko_http.log'
-$ServerLogErr = 'kafko_http.err'
+
+# --- State carried into Invoke-Cleanup ---
+$serverProcess = $null
+$writer        = $null
+
+function Invoke-Cleanup {
+    if ($script:serverProcess) {
+        try { Stop-Process -Id $script:serverProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
+        $script:serverProcess = $null
+    }
+    if ($script:writer) {
+        try { $script:writer.Close(); $script:writer.Dispose() } catch {}
+        $script:writer = $null
+    }
+    Start-Sleep -Milliseconds 300
+    if ($RunFolder -and (Test-Path $RunFolder)) {
+        Remove-Item -Recurse -Force $RunFolder -ErrorAction SilentlyContinue
+    }
+}
 
 # --- Pre-flight: oha installed? ---
 if (-not (Get-Command oha -ErrorAction SilentlyContinue)) {
@@ -45,35 +81,41 @@ if (-not (Get-Command oha -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# --- Build the kafko_http binary ---
-Write-Host "Building kafko_http (release, http-server feature)..."
-& cargo build --release --bin kafko_http --features http-server
+# --- Build the kafko-http binary (workspace member) ---
+Write-Host "Building kafko-http (release)..."
+& cargo build --release --package kafko-http
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: cargo build failed" -ForegroundColor Red
     exit 1
 }
 
-$BinaryPath = '.\target\release\kafko_http.exe'
-if (-not (Test-Path $BinaryPath)) {
-    $BinaryPath = '.\target\release\kafko_http'
+# Resolve the binary to an absolute path -- Start-Process with -RedirectStandard*
+# is unreliable with relative -FilePath values.
+$BinaryRel = 'target\release\kafko-http.exe'
+if (-not (Test-Path $BinaryRel)) {
+    $BinaryRel = 'target\release\kafko-http'
 }
+if (-not (Test-Path $BinaryRel)) {
+    Write-Host "ERROR: built binary not found at $BinaryRel" -ForegroundColor Red
+    exit 1
+}
+$BinaryPath = (Resolve-Path $BinaryRel).Path
 
-# --- Generate payload files (all-zero bytes) ---
-Write-Host "Generating payload files in $PayloadDir/..."
+# --- Create the run folder (everything ephemeral goes here) ---
+Write-Host "Creating run folder $RunFolder ..."
+New-Item -Type Directory -Force -Path $RunFolder | Out-Null
 New-Item -Type Directory -Force -Path $PayloadDir | Out-Null
+
+# --- Generate payload files (all-zero bytes) inside the run folder ---
 foreach ($size in $Sizes) {
-    $relPath = Join-Path $PayloadDir "payload_$size.bin"
-    if (-not (Test-Path $relPath)) {
-        $abs = Join-Path (Get-Location) $relPath
-        [System.IO.File]::WriteAllBytes($abs, [byte[]]::new($size))
-    }
+    $abs = Join-Path $PayloadDir "payload_$size.bin"
+    [System.IO.File]::WriteAllBytes($abs, [byte[]]::new($size))
 }
 
-# --- Open results file once via StreamWriter (UTF-8, no BOM) ---
-$resultsAbsPath = Join-Path (Get-Location) $ResultsFile
-if (Test-Path $resultsAbsPath) { Remove-Item -Path $resultsAbsPath -Force }
+# --- Open results file via StreamWriter (UTF-8, no BOM) ---
+if (Test-Path $ResultsFile) { Remove-Item -Path $ResultsFile -Force }
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-$writer = [System.IO.StreamWriter]::new($resultsAbsPath, $false, $utf8NoBom)
+$writer = [System.IO.StreamWriter]::new($ResultsFile, $false, $utf8NoBom)
 $writer.AutoFlush = $true
 
 function Write-Result {
@@ -82,91 +124,89 @@ function Write-Result {
 }
 
 # --- Write header ---
-$timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+$headerTs = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 Write-Result "kafko HTTP server benchmark (oha load test, 3 codecs)"
-Write-Result "Date:    $timestamp"
+Write-Result "Date:    $headerTs"
 Write-Result "Host:    $env:COMPUTERNAME"
 Write-Result "Server:  axum + kafko, bound to $ServerUrl, 4 worker threads"
 Write-Result "Client:  oha, $Concurrency concurrent connections"
 Write-Result "Codecs:  none / lz4 / zstd (each on its own kafko topic)"
 Write-Result "Payload: all-zero bytes (compresses trivially -- same as Kafka bench)"
+Write-Result "Run:     $RunFolder (deleted on exit)"
 Write-Result ""
 
-# --- Start the kafko_http server in background ---
-Write-Host "Starting kafko_http server (resetting data dir)..."
-$env:KAFKO_RESET    = '1'
-$env:KAFKO_DATA_DIR = '.\kafko_http_data'
-$env:KAFKO_BIND     = '127.0.0.1:9091'
-
-$serverProcess = Start-Process `
-    -FilePath $BinaryPath `
-    -PassThru `
-    -NoNewWindow `
-    -RedirectStandardOutput $ServerLogOut `
-    -RedirectStandardError  $ServerLogErr
-
-if (-not $serverProcess) {
-    Write-Host "ERROR: Failed to launch kafko_http" -ForegroundColor Red
-    $writer.Close()
-    exit 1
-}
-
-# --- Wait for server to be ready (up to 15s) ---
-Write-Host -NoNewline "Waiting for server to respond"
-$ready = $false
-for ($i = 0; $i -lt 30; $i++) {
-    try {
-        $resp = Invoke-WebRequest -Uri "$ServerUrl/hwm" -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop
-        if ($resp.StatusCode -eq 200) {
-            $ready = $true
-            Write-Host " OK"
-            break
-        }
-    } catch {
-        Write-Host -NoNewline "."
-        Start-Sleep -Milliseconds 500
-    }
-}
-
-if (-not $ready) {
-    Write-Host " FAILED" -ForegroundColor Red
-    Write-Host "Server did not respond. stderr log:"
-    if (Test-Path $ServerLogErr) { Get-Content $ServerLogErr }
-    Stop-Process -Id $serverProcess.Id -Force -ErrorAction SilentlyContinue
-    $writer.Close()
-    exit 1
-}
-
-# --- Bench runner ---
-function Invoke-OhaBench {
-    param([int]$Size, [string]$Codec, [int]$Total)
-
-    $label = "size=${Size}B codec=$Codec concurrency=$Concurrency total=$Total"
-    Write-Host ""
-    Write-Host "=== $label ===" -ForegroundColor Cyan
-    Write-Result ""
-    Write-Result "=== $label ==="
-
-    $payloadPath = Join-Path (Get-Location) (Join-Path $PayloadDir "payload_$Size.bin")
-    $url = "$ServerUrl/produce/$Codec"
-
-    $output = & oha `
-        -n $Total `
-        -c $Concurrency `
-        --no-tui `
-        -m POST `
-        -H "Content-Type: application/octet-stream" `
-        -D "$payloadPath" `
-        $url
-
-    foreach ($line in $output) {
-        Write-Host $line
-        Write-Result $line
-    }
-}
-
-# --- Run the matrix: 3 codecs x 6 sizes = 18 runs ---
 try {
+    # --- Start the kafko-http server in background ---
+    Write-Host "Starting kafko-http server (data dir = $DataDir)..."
+    $env:KAFKO_RESET    = '1'
+    $env:KAFKO_DATA_DIR = $DataDir
+    $env:KAFKO_BIND     = '127.0.0.1:9091'
+
+    $serverProcess = Start-Process `
+        -FilePath $BinaryPath `
+        -PassThru `
+        -NoNewWindow `
+        -RedirectStandardOutput $ServerLogOut `
+        -RedirectStandardError  $ServerLogErr
+
+    if (-not $serverProcess) {
+        throw "Failed to launch kafko-http"
+    }
+
+    # --- Wait for server to be ready (up to 15s) ---
+    Write-Host -NoNewline "Waiting for server to respond"
+    $ready = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        try {
+            $resp = Invoke-WebRequest -Uri "$ServerUrl/hwm" -UseBasicParsing -TimeoutSec 1 -ErrorAction Stop
+            if ($resp.StatusCode -eq 200) {
+                $ready = $true
+                Write-Host " OK"
+                break
+            }
+        } catch {
+            Write-Host -NoNewline "."
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    if (-not $ready) {
+        Write-Host " FAILED" -ForegroundColor Red
+        if (Test-Path $ServerLogErr) {
+            Write-Host "Server did not respond. stderr log:"
+            Get-Content $ServerLogErr
+        }
+        throw "Server did not become ready in time"
+    }
+
+    function Invoke-OhaBench {
+        param([int]$Size, [string]$Codec, [int]$Total)
+
+        $label = "size=${Size}B codec=$Codec concurrency=$Concurrency total=$Total"
+        Write-Host ""
+        Write-Host "=== $label ===" -ForegroundColor Cyan
+        Write-Result ""
+        Write-Result "=== $label ==="
+
+        $payloadPath = Join-Path $PayloadDir "payload_$Size.bin"
+        $url = "$ServerUrl/produce/$Codec"
+
+        $output = & oha `
+            -n $Total `
+            -c $Concurrency `
+            --no-tui `
+            -m POST `
+            -H "Content-Type: application/octet-stream" `
+            -D "$payloadPath" `
+            $url
+
+        foreach ($line in $output) {
+            Write-Host $line
+            Write-Result $line
+        }
+    }
+
+    # --- Run the matrix: 3 codecs x 6 sizes = 18 runs ---
     foreach ($codec in $Codecs) {
         Write-Host ""
         Write-Host ("=" * 60) -ForegroundColor Yellow
@@ -181,17 +221,18 @@ try {
             Invoke-OhaBench -Size $size -Codec $codec -Total $total
         }
     }
-} finally {
-    Write-Host ""
-    Write-Host "Stopping kafko_http server..."
-    Stop-Process -Id $serverProcess.Id -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
 
     Write-Result ""
     Write-Result "=== DONE -- results in $ResultsFile ==="
-    $writer.Close()
-    $writer.Dispose()
+} finally {
+    Write-Host ""
+    Write-Host "Stopping kafko-http and removing run folder..."
+    Invoke-Cleanup
 }
 
 Write-Host ""
 Write-Host "=== DONE -- results in $ResultsFile ===" -ForegroundColor Green
+
+} finally {
+    Pop-Location
+}

@@ -1,6 +1,4 @@
-// kafko_http -- minimal HTTP server exposing kafko partitions over POST /produce/:codec.
-//
-// Built only when `--features http-server` is enabled.
+// kafko-http -- minimal HTTP server exposing kafko partitions over POST /produce/:codec.
 //
 // Endpoints:
 //   POST /produce/none    body = raw bytes  ->  200, body = assigned offset (string)
@@ -15,7 +13,7 @@
 //
 // Environment variables:
 //   KAFKO_BIND        address:port to bind   (default 127.0.0.1:9091)
-//   KAFKO_DATA_DIR    kafko broker data dir  (default ./kafko_http_data)
+//   KAFKO_DATA_DIR    kafko broker data dir  (default ./kafko-http_data)
 //   KAFKO_RESET       if set, wipes the data dir at startup
 //
 // NOTE: kafko v0.2 does not persist per-topic LogConfig across restarts. The
@@ -82,7 +80,7 @@ async fn ensure_topic(broker: &Kafko, name: &str, compression: Compression) -> R
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let data_dir = std::env::var("KAFKO_DATA_DIR")
-        .unwrap_or_else(|_| "./kafko_http_data".to_string());
+        .unwrap_or_else(|_| "./kafko-http_data".to_string());
 
     if std::env::var("KAFKO_RESET").is_ok() {
         let _ = std::fs::remove_dir_all(&data_dir);

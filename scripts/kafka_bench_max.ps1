@@ -21,13 +21,22 @@
 #     - tests with no compression / lz4 / zstd
 #
 # Output:
-#   kafka_bench_max_results.txt in the current directory
+#   scripts/tmp/kafka_bench_max_results_<YYYYMMDD-HHMMSS>.txt
+
+# --- Anchor every path to the script's own location ---
+$ScriptDir   = $PSScriptRoot
+$ProjectRoot = (Resolve-Path (Join-Path $ScriptDir '..')).Path
+$TmpDir      = Join-Path $ScriptDir 'tmp'
+New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
+Push-Location $ProjectRoot
+try {
 
 $KafkaImage           = 'apache/kafka:3.7.0'
 $Container            = 'kafka-bench-max'
 $Topic                = 'bench'
 $Sizes                = @(64, 256, 512, 1024, 4096, 1048576)
-$Results              = 'kafka_bench_max_results.txt'
+$Timestamp            = (Get-Date).ToString('yyyyMMdd-HHmmss')
+$Results              = Join-Path $TmpDir "kafka_bench_max_results_$Timestamp.txt"
 $ClusterId            = 'ciWo7IWazngRchmPES6q5A'
 $ConcurrentProducers  = 8
 $MaxMessageBytes      = 16777216  # 16 MB -- big enough for 1 MB records + framing
@@ -329,3 +338,7 @@ Add-Content -Path $Results -Value ""
 Add-Content -Path $Results -Value "=== DONE -- results in $Results ==="
 Write-Host ""
 Write-Host "=== DONE -- results in $Results ===" -ForegroundColor Green
+
+} finally {
+    Pop-Location
+}
