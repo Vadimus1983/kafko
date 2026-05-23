@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, KafkoError>;
@@ -33,4 +34,7 @@ pub enum KafkoError {
 
     #[error("decompression failed")]
     DecompressionFailed,
+
+    #[error("data directory {} is already opened by another Kafko instance (file lock held)", .path.display())]
+    AlreadyOpen { path: PathBuf },
 }

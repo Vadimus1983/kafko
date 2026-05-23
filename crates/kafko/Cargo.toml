@@ -19,6 +19,7 @@ exclude = [
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
 bytes = "1"
 crc32fast = "1"
+fs4 = "0.13"
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 thiserror = "2.0.18"
 zstd = "0.13"

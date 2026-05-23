@@ -3,15 +3,22 @@ use crate::error::{KafkoError, Result};
 use crate::log::LogConfig;
 use crate::partition::Partition;
 use crate::producer::Producer;
+use fs4::fs_std::FileExt;
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+const LOCK_FILENAME: &str = "LOCK";
 
 pub struct Kafko {
     dir: PathBuf,
     topics: RwLock<HashMap<String, Arc<Partition>>>,
     default_log_config: LogConfig,
+    // Held for the broker's lifetime. Dropping the File releases the OS-level
+    // advisory lock so a future Kafko::open on the same dir can succeed.
+    _dir_lock: File,
 }
 
 impl Kafko {
@@ -25,6 +32,8 @@ impl Kafko {
     ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         tokio::fs::create_dir_all(&dir).await?;
+
+        let dir_lock = acquire_dir_lock(&dir)?;
 
         let mut topics = HashMap::new();
         let mut entries = tokio::fs::read_dir(&dir).await?;
@@ -45,6 +54,7 @@ impl Kafko {
             dir,
             topics: RwLock::new(topics),
             default_log_config,
+            _dir_lock: dir_lock,
         })
     }
 
@@ -131,6 +141,34 @@ impl Kafko {
                 let _ = owned.shutdown().await;
             }
         }
+        // _dir_lock drops here, releasing the advisory lock.
         Ok(())
+    }
+}
+
+/// Opens (creating if needed) `<dir>/LOCK` and takes a non-blocking exclusive
+/// advisory lock on it. Holding this lock for the broker's lifetime serializes
+/// access to the data dir at the process level: two `Kafko::open` calls on the
+/// same dir would otherwise interleave writes to the same segment files and
+/// corrupt each other. The lock is OS-enforced (`flock`/`LockFileEx`), so it
+/// also prevents two separate processes from racing.
+///
+/// The lock file is intentionally NOT deleted on shutdown — leaving it in place
+/// means the path is stable and there is no create/delete race on subsequent opens.
+fn acquire_dir_lock(dir: &Path) -> Result<File> {
+    let lock_path = dir.join(LOCK_FILENAME);
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+
+    match FileExt::try_lock_exclusive(&lock_file) {
+        Ok(true) => Ok(lock_file),
+        Ok(false) => Err(KafkoError::AlreadyOpen {
+            path: dir.to_path_buf(),
+        }),
+        Err(e) => Err(e.into()),
     }
 }

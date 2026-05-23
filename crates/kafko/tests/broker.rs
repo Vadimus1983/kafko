@@ -220,3 +220,44 @@ async fn has_topic_reflects_create_and_delete() {
     broker.delete_topic("orders").await.unwrap();
     assert!(!broker.has_topic("orders").await);
 }
+
+
+#[tokio::test]
+async fn second_open_on_same_dir_fails_while_first_is_live() {
+    let dir = TempDir::new().unwrap();
+    let first = Kafko::open(dir.path()).await.unwrap();
+
+    match Kafko::open(dir.path()).await {
+        Err(KafkoError::AlreadyOpen { path }) => assert_eq!(path, dir.path()),
+        Err(e) => panic!("expected AlreadyOpen, got error: {:?}", e),
+        Ok(_) => panic!("expected AlreadyOpen, got Ok"),
+    }
+
+    drop(first);
+    // After the first broker is dropped its OS-level lock is released and a
+    // fresh open on the same dir must succeed.
+    let _second = Kafko::open(dir.path()).await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_releases_lock_so_reopen_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let first = Kafko::open(dir.path()).await.unwrap();
+    first.shutdown().await.unwrap();
+
+    let _second = Kafko::open(dir.path()).await.unwrap();
+}
+
+#[tokio::test]
+async fn lock_file_persists_across_open_cycles() {
+    let dir = TempDir::new().unwrap();
+    {
+        let broker = Kafko::open(dir.path()).await.unwrap();
+        broker.shutdown().await.unwrap();
+    }
+    // The LOCK file is intentionally left on disk; verify a second open still
+    // works and treats the existing file as the lock target rather than failing
+    // to create it.
+    assert!(dir.path().join("LOCK").exists());
+    let _broker = Kafko::open(dir.path()).await.unwrap();
+}
