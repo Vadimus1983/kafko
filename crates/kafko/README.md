@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="../../docs/kafko-wordmark.png">
-    <img src="../../docs/kafko-wordmark-light.png" alt="kafko" width="320">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Vadimus1983/kafko/main/docs/kafko-wordmark.png">
+    <img src="https://raw.githubusercontent.com/Vadimus1983/kafko/main/docs/kafko-wordmark-light.png" alt="kafko" width="320">
   </picture>
 </p>
 
@@ -106,7 +106,13 @@ broker.shutdown().await?;
 # }
 ```
 
-`SIGKILL`, OS panic, and power loss bypass userspace and cannot be intercepted; the recovery path on the next `Kafko::open` handles torn tails via CRC scan, but any record whose page-cache bytes had not yet been written back by the kernel may be lost. Letting the broker drop without calling `shutdown` releases the data-directory lock but does NOT guarantee a final fsync.
+`SIGKILL`, OS panic, and power loss bypass userspace and cannot be intercepted; the recovery path on the next `Kafko::open` handles torn tails via CRC scan, but any record whose page-cache bytes had not yet been written back by the kernel may be lost.
+
+**Drop-without-shutdown fallback.** If you let the broker go out of scope without calling `shutdown()`, kafko's `Drop` impl runs the same graceful shutdown as a best-effort fallback:
+
+- On a **multi-thread tokio runtime** (the default `#[tokio::main]`), Drop uses `block_in_place` + `block_on` to drive every writer task to completion before returning. Durability is identical to explicit `shutdown()`; you just lose the ability to observe any error it might have returned.
+- On a **current-thread runtime**, Drop can't safely block — it spawns the cleanup detached and may not complete before runtime teardown. Call `shutdown().await` explicitly in this case.
+- With **no reachable tokio runtime**, Drop releases the directory lock and lets the writer tasks be aborted by whatever owns the runtime they were spawned on.
 
 If you need `acks=all`-style multi-replica durability, kafko is not the right tool — use Kafka.
 
@@ -141,10 +147,13 @@ One broker object, many cheap handles. Each partition has its own writer task th
 - Single partition per topic
 - Single consumer per topic
 - File-based segments with CRC32 integrity
-- Crash recovery on startup (torn-tail truncate)
+- Crash recovery on startup (torn-tail truncate, sparse index rebuild)
 - Time- and size-based retention
 - Producer + Consumer async API on `tokio`
 - Per-topic compression (none / lz4 / zstd)
+- Data-directory lockfile — concurrent `Kafko::open` on the same dir fails fast with `KafkoError::AlreadyOpen`
+- Writer-task panic recovery — typed `KafkoError::PartitionPanicked` instead of generic `Closed`
+- Graceful shutdown via explicit `shutdown().await` or `Drop` fallback (see [Durability](#durability))
 
 ## v0.2 — roadmap
 
@@ -164,8 +173,12 @@ One broker object, many cheap handles. Each partition has its own writer task th
 
 ## Benchmarks
 
-Apples-to-apples benchmarks against real Kafka (in Docker, single record per request, 16 concurrent producers) live in the repository at <https://github.com/Vadimus1983/kafko>. Reproducible from the scripts in the `scripts/` folder.
+Two complementary measurement shapes — HTTP-path numbers (kafko exposed via the workspace's `kafko-http` test harness, driven by `oha` in Docker) and library-only in-process numbers (`Producer::send().await` from `crates/kafko-bench`). Both, with reproducible scripts and saved baselines, live in the repository at <https://github.com/Vadimus1983/kafko>.
+
+## Codec note — LZ4 per-call allocation
+
+LZ4 (`Compression::Lz4`) currently allocates a fresh 8 KiB hash table on every record encode (16 KiB on records larger than 64 KiB). This is a property of `lz4_flex` 0.11: its public block-compress API does not expose a way to reuse the internal hash table across calls. Throughput is unaffected, but for memory-constrained or allocator-sensitive deployments **`Compression::Zstd` is the allocation-free codec on the write path** (its thread-local `zstd::bulk::Compressor` reuses internal state). See the repository README for details.
 
 ## License
 
-Licensed under **MIT OR Apache-2.0**, at your option. See [LICENSE-MIT](../../LICENSE-MIT) and [LICENSE-APACHE](../../LICENSE-APACHE).
+Licensed under **MIT OR Apache-2.0**, at your option. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
