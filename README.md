@@ -154,48 +154,65 @@ Both systems configured to send **one record per network request** with 16 concu
 
 | Size | kafko **none** | Kafka **none** | Δ | kafko **lz4** | Kafka **lz4** | Δ | kafko **zstd** | Kafka **zstd** | Δ |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 64 B    | **106,638** | 64,555 | 1.65× | **102,819** | 66,806 | 1.54× | **99,986**  | 47,211 | 2.12× |
-| 256 B   | **101,513** | 39,537 | 2.57× | **105,016** | 37,918 | 2.77× | **102,030** | 27,791 | 3.67× |
-| 512 B   | **92,107**  | 30,973 | 2.97× | **104,222** | 26,526 | 3.93× | **96,380**  | 19,045 | 5.06× |
-| 1 KiB   | **76,754**  | 21,980 | 3.49× | **101,391** | 19,703 | 5.15× | **98,395**  | 14,564 | 6.76× |
-| 4 KiB   | **26,979**  | 6,916  | 3.90× | **97,632**  | 5,941  | 16.4× | **95,316**  | 4,125  | 23.1× |
-| 128 KiB | **8,480**   | n/a¹   | n/a   | **27,698**  | n/a¹   | n/a   | **31,493**  | n/a¹   | n/a   |
-| 1 MiB   | **1,770**   | 256    | 6.91× | **6,199**   | 238    | 26.0× | **4,848**   | 215    | 22.5× |
+| 64 B    | **139,037** | 64,555 | 2.15× | **139,077** | 66,806 | 2.08× | **125,207** | 47,211 | 2.65× |
+| 256 B   | **137,057** | 39,537 | 3.47× | **138,972** | 37,918 | 3.66× | **125,603** | 27,791 | 4.52× |
+| 512 B   | **134,196** | 30,973 | 4.33× | **137,229** | 26,526 | 5.17× | **126,404** | 19,045 | 6.64× |
+| 1 KiB   | **134,435** | 21,980 | 6.12× | **136,338** | 19,703 | 6.92× | **123,555** | 14,564 | 8.48× |
+| 4 KiB   | **38,774**  | 6,916  | 5.61× | **130,602** | 5,941  | 22.0× | **117,388** | 4,125  | 28.5× |
+| 128 KiB | **13,113**  | n/a    | n/a   | **57,842**  | n/a    | n/a   | **44,259**  | n/a    | n/a   |
+| 1 MiB   | **818**     | 256    | 3.20× | **6,193**   | 238    | 26.0× | **4,834**   | 215    | 22.5× |
 
-¹ The 128 KiB cell was added to `kafka_bench_unbatched.ps1` after its most recent run; rerun that script to populate the Kafka column at 128 KiB. (Why 128 KiB? It's Kafka's default `batch.size`, so the cell asks: what does kafko do when it's sending the same payload size Kafka would naturally pack into one batched network call?)
-
-kafko wins every apples-to-apples cell. At small records, the win is 1.5-3×; at large records with compression, it grows to **22-26×**.
+kafko wins every apples-to-apples cell. At small records, the win is 2-3×; at large records with compression, it grows to **22-28×**. The 128 KiB Kafka column is empty because that cell wasn't part of `kafka_bench_unbatched.ps1`'s matrix; re-run that script if you need it populated.
 
 ### Payload throughput — MiB/s committed
 
 | Size | kafko none | Kafka none | kafko lz4 | Kafka lz4 | kafko zstd | Kafka zstd |
 |---|---:|---:|---:|---:|---:|---:|
-| 64 B    | 6.5   | 3.9  | 6.3   | 4.1  | 6.1   | 2.9  |
-| 256 B   | 24.8  | 9.7  | 25.6  | 9.3  | 24.9  | 6.8  |
-| 1 KiB   | 75.0  | 21.5 | 99.0  | 19.2 | 96.1  | 14.2 |
-| 4 KiB   | 105.4 | 27.0 | **381.4** | 23.2 | **372.3** | 16.1 |
-| 128 KiB | **1,060** | n/a¹ | **3,462** | n/a¹ | **3,937** | n/a¹ |
-| **1 MiB** | **1,770** | 256 | **6,199** | 238 | **4,848** | 215 |
+| 64 B    | 8.5   | 3.9  | 8.5   | 4.1  | 7.6   | 2.9  |
+| 256 B   | 33.5  | 9.7  | 33.9  | 9.3  | 30.7  | 6.8  |
+| 1 KiB   | 131.3 | 21.5 | 133.1 | 19.2 | 120.7 | 14.2 |
+| 4 KiB   | 151.5 | 27.0 | **510.2** | 23.2 | **458.5** | 16.1 |
+| 128 KiB | **1,639** | n/a  | **7,230** | n/a  | **5,532** | n/a  |
+| **1 MiB** | **818** | 256 | **6,193** | 238 | **4,834** | 215 |
 
 ### Latency — p50 (median, codec = none)
 
 | Size | kafko p50 | Kafka p50 |
 |---|---:|---:|
-| 64 B    | **0.14 ms** | 3,079 ms |
-| 256 B   | **0.15 ms** | 5,549 ms |
-| 512 B   | **0.16 ms** | 9,086 ms |
-| 1 KiB   | **0.20 ms** | 12,386 ms |
-| 4 KiB   | **0.58 ms** | 2,155 ms |
-| 128 KiB | **1.86 ms** | n/a¹ |
-| 1 MiB   | **8.94 ms** | 424 ms |
+| 64 B    | **0.11 ms** | 3,079 ms |
+| 256 B   | **0.11 ms** | 5,549 ms |
+| 512 B   | **0.11 ms** | 9,086 ms |
+| 1 KiB   | **0.11 ms** | 12,386 ms |
+| 4 KiB   | **0.14 ms** | 2,155 ms |
+| 128 KiB | **1.21 ms** | n/a |
+| 1 MiB   | **9.22 ms** | 424 ms |
 
 The Kafka latency values are dominated by **client-side queue saturation**: with `max.in.flight=1` and `linger.ms=0`, the Java producer cannot avoid pile-up when records arrive faster than the broker can ack one-at-a-time. kafko's `oha` is strictly synchronous per connection (send → wait → receive → next), so its p50 is honest HTTP round-trip time. This is exactly the "Kafka assumes you batch" story — without batching, **Kafka's producer-side architecture forces queueing that kafko's simpler request-response shape sidesteps.**
+
+### Library hot path (in-process, no HTTP)
+
+The tables above measure kafko via the HTTP test harness so the comparison vs Kafka is honest. For users who plan to embed kafko directly (the killer use case — `Producer::send().await` from inside the same process), the library-only numbers are higher because there is no HTTP, axum, or `oha` overhead in the path.
+
+Measured by `crates/kafko-bench` (in-process, 16 concurrent `tokio::spawn` producers sharing one `Producer`):
+
+| Size | none rec/s | lz4 rec/s | zstd rec/s |
+|---|---:|---:|---:|
+| 64 B    | 1,122,798 | 1,323,455 |   689,843 |
+| 256 B   |   904,190 | 1,382,915 |   692,955 |
+| 1 KiB   |   560,482 | 1,158,094 |   676,439 |
+| 4 KiB   |   253,589 | 1,043,108 |   622,537 |
+| 128 KiB |    22,245 |    95,816 |   131,684 |
+| 1 MiB   |     3,264 |    13,402 |     7,432 |
+
+Same machine, same workload semantics, no network. Small-record cells nearly 10× the HTTP-path numbers — that's the cost of HTTP serialization, TCP setup, and axum routing per request. Library users skip all of it.
+
+Snapshots and full methodology in `crates/kafko-bench/baselines/`.
 
 ### Honest framing
 
 Apache Kafka is designed for **batched, throughput-oriented workloads** — `linger.ms` and `batch.size` are not optional in production. With its default-tuned client batching (50 ms linger, 128 KiB batches), Kafka reaches ~1.15M rec/s at 64 B by amortizing one network call across ~2,000 records.
 
-When both systems are configured for the same workload — **one record per network request** — kafko outperforms Kafka by 1.5-27× across every record size at a fraction of the latency.
+When both systems are configured for the same workload — **one record per network request** — kafko outperforms Kafka by 2-28× across every record size at a fraction of the latency. The widest gaps appear on **medium and large records with compression**, where Kafka's per-batch overhead dominates and kafko's single-syscall write path runs essentially full-speed.
 
 Once kafko gains a `send_batch` API (planned, v0.2), the expectation is that it matches or beats batched Kafka on small-record throughput while preserving the latency lead.
 
