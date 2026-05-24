@@ -39,6 +39,12 @@ pub struct Log {
     config: LogConfig,
     segments: Vec<IndexedSegment>,
     next_offset: u64,
+    // Scratch buffers reused across append_batch calls. The partition writer task
+    // is the single mutator of Log (the actor-style single-writer-per-partition
+    // invariant), so there is never a concurrent borrow. Cleared at the start of
+    // every batch; their capacity grows to the largest batch's needs and then stays.
+    encode_buf: BytesMut,
+    actual_sizes: Vec<usize>,
 }
 
 struct IndexedSegment {
@@ -56,6 +62,8 @@ impl Log {
             config,
             segments: vec![IndexedSegment { segment, index }],
             next_offset: 0,
+            encode_buf: BytesMut::new(),
+            actual_sizes: Vec::new(),
         })
     }
 
@@ -94,6 +102,8 @@ impl Log {
             config,
             segments,
             next_offset,
+            encode_buf: BytesMut::new(),
+            actual_sizes: Vec::new(),
         })
     }
 
@@ -157,13 +167,7 @@ impl Log {
             return Ok(Vec::new());
         }
 
-        let mut sizes = Vec::with_capacity(records.len());
-        let mut total_wire_size = 0usize;
-        for record in &records {
-            let s = record.wire_size();
-            sizes.push(s);
-            total_wire_size += s;
-        }
+        let total_wire_size: usize = records.iter().map(|r| r.wire_size()).sum();
 
         let should_rotate = self
             .segments
@@ -176,21 +180,22 @@ impl Log {
         }
 
         let compression = self.config.compression;
-        let mut buf = BytesMut::with_capacity(total_wire_size);
-        let mut actual_sizes = Vec::with_capacity(records.len());
+        self.encode_buf.clear();
+        self.encode_buf.reserve(total_wire_size);
+        self.actual_sizes.clear();
         let mut offsets = Vec::with_capacity(records.len());
         let mut current_offset = self.next_offset;
         for record in records {
             offsets.push(current_offset);
             current_offset += 1;
-            let actual = record.encode_with(&mut buf, compression);
-            actual_sizes.push(actual);
+            let actual = record.encode_with(&mut self.encode_buf, compression);
+            self.actual_sizes.push(actual);
         }
 
         let active = self.segments.last_mut().unwrap();
-        let mut file_pos = active.segment.append(&buf).await?;
+        let mut file_pos = active.segment.append(&self.encode_buf).await?;
 
-        for (i, &size) in actual_sizes.iter().enumerate() {
+        for (i, &size) in self.actual_sizes.iter().enumerate() {
             active
                 .index
                 .track_append(offsets[i], file_pos, size)
@@ -199,9 +204,6 @@ impl Log {
         }
 
         self.next_offset = current_offset;
-        // sizes (computed up-front for estimation) is no longer used after compression-aware sizing;
-        // silence the unused warning by ignoring it.
-        let _ = sizes;
         Ok(offsets)
     }
 
