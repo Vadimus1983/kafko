@@ -10,6 +10,7 @@ repository = "https://github.com/Vadimus1983/kafko"
 homepage = "https://github.com/Vadimus1983/kafko"
 documentation = "https://docs.rs/kafko"
 readme = "README.md"
+authors = ["Vadym Prygoda <https://github.com/Vadimus1983>"]
 exclude = [
     "tests/",
     "benches/",
