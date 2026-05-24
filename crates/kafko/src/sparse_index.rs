@@ -43,8 +43,16 @@ impl SparseIndex {
         let bytes = std::fs::read(&path)?;
         let mut entries = Vec::with_capacity(bytes.len() / ENTRY_SIZE);
         for chunk in bytes.chunks_exact(ENTRY_SIZE) {
-            let relative_offset = u32::from_be_bytes(chunk[0..4].try_into().unwrap());
-            let file_position = u32::from_be_bytes(chunk[4..8].try_into().unwrap());
+            let relative_offset = u32::from_be_bytes(
+                chunk[0..4]
+                    .try_into()
+                    .expect("chunks_exact(8) guarantees chunk[0..4] is [u8; 4]"),
+            );
+            let file_position = u32::from_be_bytes(
+                chunk[4..8]
+                    .try_into()
+                    .expect("chunks_exact(8) guarantees chunk[4..8] is [u8; 4]"),
+            );
             entries.push(IndexEntry {
                 relative_offset,
                 file_position,

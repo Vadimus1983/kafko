@@ -87,7 +87,7 @@ impl Log {
             segments.push(IndexedSegment { segment, index });
         }
 
-        let active_base = *base_offsets.last().unwrap();
+        let active_base = *base_offsets.last().expect("base_offsets non-empty: is_empty branch returns above");
         let (active_segment, active_index, active_record_count) =
             recover_active_segment(dir, active_base, config.index_interval).await?;
         segments.push(IndexedSegment {
@@ -135,7 +135,7 @@ impl Log {
         let should_rotate = self
             .segments
             .last()
-            .unwrap()
+            .expect("segments invariant: never empty after create")
             .segment
             .would_overflow(wire_size_estimate, self.config.segment_size_threshold);
 
@@ -146,7 +146,10 @@ impl Log {
         let mut buf = BytesMut::with_capacity(wire_size_estimate);
         let actual_size = record.encode_with(&mut buf, compression);
 
-        let active = self.segments.last_mut().unwrap();
+        let active = self
+            .segments
+            .last_mut()
+            .expect("segments invariant: never empty after create");
         let file_pos = active.segment.append(&buf).await?;
 
         let offset = self.next_offset;
@@ -172,7 +175,7 @@ impl Log {
         let should_rotate = self
             .segments
             .last()
-            .unwrap()
+            .expect("segments invariant: never empty after create")
             .segment
             .would_overflow(total_wire_size, self.config.segment_size_threshold);
         if should_rotate {
@@ -192,7 +195,10 @@ impl Log {
             self.actual_sizes.push(actual);
         }
 
-        let active = self.segments.last_mut().unwrap();
+        let active = self
+            .segments
+            .last_mut()
+            .expect("segments invariant: never empty after create");
         let mut file_pos = active.segment.append(&self.encode_buf).await?;
 
         for (i, &size) in self.actual_sizes.iter().enumerate() {
@@ -245,7 +251,10 @@ impl Log {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn sync(&mut self) -> Result<()> {
-        let active = self.segments.last_mut().unwrap();
+        let active = self
+            .segments
+            .last_mut()
+            .expect("segments invariant: never empty after create");
         active.segment.sync().await?;
         active.index.sync().await?;
         Ok(())

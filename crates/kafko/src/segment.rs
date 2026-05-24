@@ -12,6 +12,15 @@ pub struct Segment {
     file: File,
     size: u64,
     // Tracked cursor position to avoid redundant seeks. None = unknown, force seek.
+    //
+    // This optimization is sound ONLY because the partition writer task owns this
+    // Segment exclusively (the single-writer-per-partition invariant). With one
+    // owner, no other task can change `file`'s position between our seek and the
+    // following read/write — so we can skip the seek when we already know we're
+    // at the requested position. If a second concurrent caller were ever to touch
+    // `file` (currently impossible by construction), this field would become a
+    // correctness hazard: the cached cursor could disagree with the kernel's view
+    // and a "no seek needed" branch would read or write at the wrong offset.
     cursor: Option<u64>,
 }
 

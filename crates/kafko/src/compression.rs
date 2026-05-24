@@ -77,7 +77,7 @@ impl Compression {
                 let bound = zstd::zstd_safe::compress_bound(raw.len());
                 out.reserve(bound);
                 c.as_mut()
-                    .unwrap()
+                    .expect("compressor initialized by the is_none branch above")
                     .compress_to_buffer(raw, out)
                     .expect("zstd compress should not fail with compress_bound-sized buffer");
             }),
@@ -98,7 +98,7 @@ impl Compression {
                     );
                 }
                 d.as_mut()
-                    .unwrap()
+                    .expect("decompressor initialized by the is_none branch above")
                     .decompress(compressed, ZSTD_DECOMPRESS_MAX_SIZE)
                     .map_err(|_| KafkoError::DecompressionFailed)
             }),
