@@ -135,67 +135,63 @@ This contract is identical to what Kafka calls `acks=1` and is the *fair* compar
 
 ## Benchmarks
 
-All numbers from a single machine, both systems running in Linux Docker containers, both load tests running **inside their respective containers** (`oha` inside the kafko container; `kafka-producer-perf-test.sh` inside the Kafka container). Container loopback only — no Windows TCP, no port forwarding. Reproducible from `scripts/kafko_docker_bench.ps1` and `scripts/kafka_bench_unbatched.ps1`.
+All numbers measured on a single machine. Two complementary views: the **HTTP path** (kafko exposed via `kafko-http` over Docker container loopback, driven by `oha`) and the **library hot path** (in-process via `Producer::send().await` from `crates/kafko-bench`). The first matters when kafko is behind a network listener; the second matters when it's embedded.
 
-### Methodology — apples-to-apples
+Reproducible from `scripts/kafko_docker_bench.ps1` (HTTP) and `cargo run --release -p kafko-bench` (in-process).
 
-Both systems configured to send **one record per network request** with 16 concurrent producers:
+### Methodology
 
-| | kafko | Kafka |
+| | HTTP path | In-process |
 |---|---|---|
-| Image | Debian slim + `kafko-http` + oha | `apache/kafka:3.7.0` + perf-test |
-| Server config | axum 0.7 + kafko, port 9091 | KRaft single-node, 8 io/net threads, 16 MiB max msg, 1 GiB JVM heap |
-| Client config | oha, `-c 16`, one HTTP request per record | `linger.ms=0`, `batch.size=size+1024`, `max.in.flight=1`, `acks=1`, 16 parallel `kafka-producer-perf-test.sh` processes |
-| Durability | record in OS page cache at `send().await` (same contract as Kafka `acks=1`) | `acks=1` — leader has appended to page cache |
+| Driver | `oha` (in container), 16 concurrent connections, one HTTP request per record | 16 `tokio::spawn` tasks each calling `Producer::send().await` in a loop |
+| Server | axum 0.7 + kafko on port 9091 | (none — in-process) |
+| Durability | record in OS file (page cache) at `send().await` | same |
 | Payload | all-zero bytes | all-zero bytes |
-| Compression codecs | none / lz4 / zstd (per-topic) | none / lz4 / zstd (`compression.type`) |
+| Compression codecs | none / lz4 / zstd (per-topic) | same |
+| Runtime | `multi_thread`, default worker count (one per logical CPU) | `multi_thread, worker_threads = 4` |
 
-### Throughput — records/sec (16 concurrent producers, wall-clock aggregate)
+### HTTP path — records/sec (16 concurrent producers, wall-clock aggregate)
 
-| Size | kafko **none** | Kafka **none** | Δ | kafko **lz4** | Kafka **lz4** | Δ | kafko **zstd** | Kafka **zstd** | Δ |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 64 B    | **139,037** | 64,555 | 2.15× | **139,077** | 66,806 | 2.08× | **125,207** | 47,211 | 2.65× |
-| 256 B   | **137,057** | 39,537 | 3.47× | **138,972** | 37,918 | 3.66× | **125,603** | 27,791 | 4.52× |
-| 512 B   | **134,196** | 30,973 | 4.33× | **137,229** | 26,526 | 5.17× | **126,404** | 19,045 | 6.64× |
-| 1 KiB   | **134,435** | 21,980 | 6.12× | **136,338** | 19,703 | 6.92× | **123,555** | 14,564 | 8.48× |
-| 4 KiB   | **38,774**  | 6,916  | 5.61× | **130,602** | 5,941  | 22.0× | **117,388** | 4,125  | 28.5× |
-| 128 KiB | **13,113**  | n/a    | n/a   | **57,842**  | n/a    | n/a   | **44,259**  | n/a    | n/a   |
-| 1 MiB   | **818**     | 256    | 3.20× | **6,193**   | 238    | 26.0× | **4,834**   | 215    | 22.5× |
+| Size | none | lz4 | zstd |
+|---|---:|---:|---:|
+| 64 B    | 139,037 | 139,077 | 125,207 |
+| 256 B   | 137,057 | 138,972 | 125,603 |
+| 512 B   | 134,196 | 137,229 | 126,404 |
+| 1 KiB   | 134,435 | 136,338 | 123,555 |
+| 4 KiB   |  38,774 | 130,602 | 117,388 |
+| 128 KiB |  13,113 |  57,842 |  44,259 |
+| 1 MiB   |     818 |   6,193 |   4,834 |
 
-kafko wins every apples-to-apples cell. At small records, the win is 2-3×; at large records with compression, it grows to **22-28×**. The 128 KiB Kafka column is empty because that cell wasn't part of `kafka_bench_unbatched.ps1`'s matrix; re-run that script if you need it populated.
+### HTTP path — MiB/s committed
 
-### Payload throughput — MiB/s committed
+| Size | none | lz4 | zstd |
+|---|---:|---:|---:|
+| 64 B    |     8.5 |     8.5 |     7.6 |
+| 256 B   |    33.5 |    33.9 |    30.7 |
+| 1 KiB   |   131.3 |   133.1 |   120.7 |
+| 4 KiB   |   151.5 | **510.2** | **458.5** |
+| 128 KiB | **1,639** | **7,230** | **5,532** |
+| 1 MiB   |     818 |   6,193 |   4,834 |
 
-| Size | kafko none | Kafka none | kafko lz4 | Kafka lz4 | kafko zstd | Kafka zstd |
-|---|---:|---:|---:|---:|---:|---:|
-| 64 B    | 8.5   | 3.9  | 8.5   | 4.1  | 7.6   | 2.9  |
-| 256 B   | 33.5  | 9.7  | 33.9  | 9.3  | 30.7  | 6.8  |
-| 1 KiB   | 131.3 | 21.5 | 133.1 | 19.2 | 120.7 | 14.2 |
-| 4 KiB   | 151.5 | 27.0 | **510.2** | 23.2 | **458.5** | 16.1 |
-| 128 KiB | **1,639** | n/a  | **7,230** | n/a  | **5,532** | n/a  |
-| **1 MiB** | **818** | 256 | **6,193** | 238 | **4,834** | 215 |
+### HTTP path — latency p50 (codec = none)
 
-### Latency — p50 (median, codec = none)
+| Size | p50 |
+|---|---:|
+| 64 B    | 0.11 ms |
+| 256 B   | 0.11 ms |
+| 512 B   | 0.11 ms |
+| 1 KiB   | 0.11 ms |
+| 4 KiB   | 0.14 ms |
+| 128 KiB | 1.21 ms |
+| 1 MiB   | 9.22 ms |
 
-| Size | kafko p50 | Kafka p50 |
-|---|---:|---:|
-| 64 B    | **0.11 ms** | 3,079 ms |
-| 256 B   | **0.11 ms** | 5,549 ms |
-| 512 B   | **0.11 ms** | 9,086 ms |
-| 1 KiB   | **0.11 ms** | 12,386 ms |
-| 4 KiB   | **0.14 ms** | 2,155 ms |
-| 128 KiB | **1.21 ms** | n/a |
-| 1 MiB   | **9.22 ms** | 424 ms |
+Latency is `oha`'s synchronous-per-connection request-response time (send → wait → receive → next), so this is honest end-to-end HTTP RTT through the kafko stack including write-to-page-cache.
 
-The Kafka latency values are dominated by **client-side queue saturation**: with `max.in.flight=1` and `linger.ms=0`, the Java producer cannot avoid pile-up when records arrive faster than the broker can ack one-at-a-time. kafko's `oha` is strictly synchronous per connection (send → wait → receive → next), so its p50 is honest HTTP round-trip time. This is exactly the "Kafka assumes you batch" story — without batching, **Kafka's producer-side architecture forces queueing that kafko's simpler request-response shape sidesteps.**
+### Library hot path — records/sec (in-process, no HTTP)
 
-### Library hot path (in-process, no HTTP)
+For users who plan to embed kafko directly — the killer use case — the library-only numbers are higher because there is no HTTP, axum, or `oha` overhead in the path.
 
-The tables above measure kafko via the HTTP test harness so the comparison vs Kafka is honest. For users who plan to embed kafko directly (the killer use case — `Producer::send().await` from inside the same process), the library-only numbers are higher because there is no HTTP, axum, or `oha` overhead in the path.
-
-Measured by `crates/kafko-bench` (in-process, 16 concurrent `tokio::spawn` producers sharing one `Producer`):
-
-| Size | none rec/s | lz4 rec/s | zstd rec/s |
+| Size | none | lz4 | zstd |
 |---|---:|---:|---:|
 | 64 B    | 1,122,798 | 1,323,455 |   689,843 |
 | 256 B   |   904,190 | 1,382,915 |   692,955 |
@@ -204,9 +200,9 @@ Measured by `crates/kafko-bench` (in-process, 16 concurrent `tokio::spawn` produ
 | 128 KiB |    22,245 |    95,816 |   131,684 |
 | 1 MiB   |     3,264 |    13,402 |     7,432 |
 
-Same machine, same workload semantics, no network. Small-record cells nearly 10× the HTTP-path numbers — that's the cost of HTTP serialization, TCP setup, and axum routing per request. Library users skip all of it.
+Small-record cells are nearly 10× the HTTP-path numbers — that's the cost of HTTP serialization, TCP setup, and axum routing per request. Library users skip all of it.
 
-Snapshots and full methodology in `crates/kafko-bench/baselines/`.
+Function-level timing + allocation snapshots and full methodology in `crates/kafko-bench/baselines/`.
 
 ### Codec note — LZ4 per-call allocation
 
@@ -215,14 +211,6 @@ LZ4 (`Compression::Lz4`) allocates a fresh **8 KiB hash table on every record en
 The allocations are short-lived (freed immediately after each call) and don't visibly hurt throughput — LZ4 is still the rec/s leader at small records. But for memory-constrained or allocator-sensitive deployments, **zstd is the allocation-free codec on the write path**: `zstd::bulk::Compressor` is held in a thread-local and reuses its internal state across calls, so zstd's per-record heap footprint is essentially zero.
 
 This is fixable only at the dependency level — either when `lz4_flex` exposes a stateful block-compressor API, or by vendoring a slim equivalent into kafko.
-
-### Honest framing
-
-Apache Kafka is designed for **batched, throughput-oriented workloads** — `linger.ms` and `batch.size` are not optional in production. With its default-tuned client batching (50 ms linger, 128 KiB batches), Kafka reaches ~1.15M rec/s at 64 B by amortizing one network call across ~2,000 records.
-
-When both systems are configured for the same workload — **one record per network request** — kafko outperforms Kafka by 2-28× across every record size at a fraction of the latency. The widest gaps appear on **medium and large records with compression**, where Kafka's per-batch overhead dominates and kafko's single-syscall write path runs essentially full-speed.
-
-Once kafko gains a `send_batch` API (planned, v0.2), the expectation is that it matches or beats batched Kafka on small-record throughput while preserving the latency lead.
 
 ## v0.1 — what's in
 
@@ -269,15 +257,17 @@ cargo build --release --package kafko-http
 # Run all tests
 cargo test --workspace
 
-# Run kafko storage benchmarks
+# Run kafko storage micro-benchmarks (criterion)
 cargo bench --package kafko
 
-# Reproduce the apples-to-apples Kafka comparison (Windows PowerShell)
+# Reproduce the HTTP-path bench (Windows PowerShell, requires Docker)
 .\scripts\kafko_docker_bench.ps1
-.\scripts\kafka_bench_unbatched.ps1
+
+# Reproduce the in-process library bench
+cargo run --release -p kafko-bench
 ```
 
-See [`scripts/README.md`](scripts/README.md) for the full bench script catalogue (default Kafka, max-tuned Kafka, apples-to-apples, host-side kafko, Docker-side kafko).
+See [`scripts/README.md`](scripts/README.md) for the full bench-script catalogue.
 
 ## License
 
