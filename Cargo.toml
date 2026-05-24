@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/kafko",
     "crates/kafko-http",
+    "crates/kafko-bench",
 ]
 
 [profile.bench]

@@ -15,12 +15,14 @@ impl Producer {
         Self { partition }
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn send(&self, key: Option<Bytes>, value: Bytes) -> Result<u64> {
         let timestamp_ms = current_timestamp_ms();
         let record = Record::new(timestamp_ms, key, value);
         self.partition.append(record).await
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn send_record(&self, record: Record) -> Result<u64> {
         self.partition.append(record).await
     }

@@ -35,6 +35,10 @@ enum PartitionCommand {
     // Forces the writer task to panic. Reachable only via Partition::poison_for_test
     // (doc-hidden test seam); not exposed in any public producer or consumer API.
     Poison,
+    // Stashes an io::ErrorKind that the writer will use to synthesize a failure on
+    // its next Append batch instead of touching the disk. Reachable only via
+    // Partition::fail_next_append_for_test; doc-hidden test seam.
+    FailNextAppend { kind: std::io::ErrorKind },
 }
 
 impl Partition {
@@ -73,6 +77,7 @@ impl Partition {
         })
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn append(&self, record: Record) -> Result<u64> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -171,6 +176,20 @@ impl Partition {
         Ok(())
     }
 
+    /// Test-only escape hatch that makes the writer's next Append batch fail
+    /// with `io::Error::from(kind)` without touching the disk. After the
+    /// failure, the stash clears and subsequent appends behave normally —
+    /// exercising the contract that an IO error from `append` does NOT take
+    /// the partition offline. Not intended for production code.
+    #[doc(hidden)]
+    pub async fn fail_next_append_for_test(&self, kind: std::io::ErrorKind) -> Result<()> {
+        self.inbox
+            .send(PartitionCommand::FailNextAppend { kind })
+            .await
+            .map_err(|_| KafkoError::Closed)?;
+        Ok(())
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         drop(self.inbox);
         // Awaiting the supervisor instead of the writer task directly: the
@@ -203,6 +222,9 @@ async fn partition_writer_loop(
 
     let batch_max_records = log.config().batch_max_records;
     let batch_max_bytes = log.config().batch_max_bytes;
+    // Stash for the test-only fault injection. Set by FailNextAppend, consumed
+    // by the next Append (batched or single). Never read by production callers.
+    let mut fail_next_kind: Option<std::io::ErrorKind> = None;
 
     loop {
         tokio::select! {
@@ -215,6 +237,7 @@ async fn partition_writer_loop(
                     cmd,
                     batch_max_records,
                     batch_max_bytes,
+                    &mut fail_next_kind,
                 ).await;
             }
             _ = retention_tick.tick() => {
@@ -242,11 +265,12 @@ async fn process_with_batching(
     first: PartitionCommand,
     batch_max_records: usize,
     batch_max_bytes: u64,
+    fail_next_kind: &mut Option<std::io::ErrorKind>,
 ) {
     let (record, reply) = match first {
         PartitionCommand::Append { record, reply } => (record, reply),
         other => {
-            handle_single_command(log, hwm_tx, other).await;
+            handle_single_command(log, hwm_tx, other, fail_next_kind).await;
             return;
         }
     };
@@ -265,24 +289,33 @@ async fn process_with_batching(
                 replies.push(reply);
             }
             Ok(other) => {
-                flush_append_batch(log, hwm_tx, records, replies).await;
-                handle_single_command(log, hwm_tx, other).await;
+                flush_append_batch(log, hwm_tx, records, replies, fail_next_kind).await;
+                handle_single_command(log, hwm_tx, other, fail_next_kind).await;
                 return;
             }
             Err(_) => break,
         }
     }
 
-    flush_append_batch(log, hwm_tx, records, replies).await;
+    flush_append_batch(log, hwm_tx, records, replies, fail_next_kind).await;
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn flush_append_batch(
     log: &mut Log,
     hwm_tx: &watch::Sender<u64>,
     records: Vec<Record>,
     replies: Vec<oneshot::Sender<Result<u64>>>,
+    fail_next_kind: &mut Option<std::io::ErrorKind>,
 ) {
     if records.is_empty() {
+        return;
+    }
+    if let Some(kind) = fail_next_kind.take() {
+        let synth = KafkoError::Io(std::io::Error::from(kind));
+        for reply in replies {
+            let _ = reply.send(Err(synth.clone()));
+        }
         return;
     }
     match log.append_batch(records).await {
@@ -294,17 +327,31 @@ async fn flush_append_batch(
                 let _ = reply.send(Ok(offset));
             }
         }
-        Err(_) => {
+        Err(e) => {
+            // Surface the real cause to every waiter so callers can match on
+            // io::ErrorKind (e.g. StorageFull) and decide whether to retry.
+            // The partition stays alive: the writer task continues serving
+            // subsequent commands. A successful future append clears the
+            // condition from the caller's perspective.
             for reply in replies {
-                let _ = reply.send(Err(KafkoError::Closed));
+                let _ = reply.send(Err(e.clone()));
             }
         }
     }
 }
 
-async fn handle_single_command(log: &mut Log, hwm_tx: &watch::Sender<u64>, cmd: PartitionCommand) {
+async fn handle_single_command(
+    log: &mut Log,
+    hwm_tx: &watch::Sender<u64>,
+    cmd: PartitionCommand,
+    fail_next_kind: &mut Option<std::io::ErrorKind>,
+) {
     match cmd {
         PartitionCommand::Append { record, reply } => {
+            if let Some(kind) = fail_next_kind.take() {
+                let _ = reply.send(Err(KafkoError::Io(std::io::Error::from(kind))));
+                return;
+            }
             let result = log.append(record).await;
             if let Ok(offset) = &result {
                 let _ = hwm_tx.send(*offset + 1);
@@ -321,6 +368,9 @@ async fn handle_single_command(log: &mut Log, hwm_tx: &watch::Sender<u64>, cmd: 
         }
         PartitionCommand::Poison => {
             panic!("intentional panic from poison command (test-only)");
+        }
+        PartitionCommand::FailNextAppend { kind } => {
+            *fail_next_kind = Some(kind);
         }
     }
 }

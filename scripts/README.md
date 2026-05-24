@@ -10,6 +10,8 @@ Run all scripts **from the project root** (e.g. `.\scripts\kafko_docker_bench.ps
 |---|---|---|
 | `Dockerfile` | Builds the `kafko-http:bench` image used by `kafko_docker_bench.ps1`. Multi-stage: Rust builder produces the `kafko-http` binary + installs `oha`, then a slim Debian runtime ships both. | — |
 | `kafko_http_bench.ps1` | **Host-side** benchmark of `kafko-http`. Builds the binary locally, starts it, runs `oha` from the host against `127.0.0.1:9091`. | `kafko-http_bench_results_<ts>.txt` (+ `run_<ts>/` while running, then deleted) |
+| `kafko_http_samply_bench.ps1` | **Profiling** run of `kafko-http`. Same shape as the host bench, but builds in DEBUG and wraps the binary in `samply record` so a CPU profile is captured while `oha` drives load. Smaller matrix to keep debug-mode runtime tolerable. Throughput is NOT comparable to the release bench. | `kafko-http_samply_results_<ts>.txt`, `kafko-http_samply_<ts>.profile.json` (open with `samply load <file>` or upload to <https://profiler.firefox.com/>) |
+| `kafko_lib_samply_bench.ps1` | **Profiling** run of the kafko library directly, via the `kafko-bench` workspace binary. No HTTP, no axum, no oha. The resulting profile shows only kafko's storage hot path + tokio task scheduling, without HTTP machinery dominating the flame graph. Same matrix as the HTTP samply bench. | `kafko-lib_samply_results_<ts>.txt`, `kafko-lib_samply_<ts>.profile.json` |
 | `kafko_docker_bench.ps1` | **Docker-side** benchmark of `kafko-http`. Builds the container, starts it, runs `oha` *inside* the container so the request path is container-loopback only (mirrors the Kafka bench shape). | `kafko_docker_bench_results_<ts>.txt` |
 | `kafka_bench.ps1` | Baseline Kafka comparison: `apache/kafka:3.7.0` in KRaft mode, default settings. Runs `kafka-producer-perf-test.sh` inside the container. | `kafka_bench_results_<ts>.txt` |
 | `kafka_bench_max.ps1` | Kafka tuned for maximum throughput — large socket buffers, 8 io/network threads, `linger.ms=50`, dynamic `batch.size` and `buffer.memory`, 1 GiB heap. Shows Kafka's natural batched throughput. | `kafka_bench_max_results_<ts>.txt` |
@@ -39,6 +41,9 @@ The Docker scripts don't need a host-side run folder: the container *is* the run
 - **Comparing kafko vs Kafka fairly** → run `kafko_docker_bench.ps1` + `kafka_bench_unbatched.ps1`. Both put server and client inside their own container; both use one record per network call. Numbers from these two files are directly comparable.
 - **Comparing kafko vs production-tuned Kafka** → run `kafko_docker_bench.ps1` + `kafka_bench_max.ps1`. Kafka wins on small-record throughput because client-side batching is its native mode. This is the comparison Kafka's design assumes; kafko will close the gap once `Producer::send_batch` lands in v0.2.
 - **Local kafko sanity check (no Docker)** → `kafko_http_bench.ps1` builds and runs everything on the host.
+- **Find a kafko hot spot** → two flavours of profiling. Pick by what you want to see in the flame graph:
+  - `kafko_lib_samply_bench.ps1` — **storage path only.** Runs `kafko-bench` (an in-process workload binary in the workspace), no HTTP / axum / oha. Best for tuning the partition writer, segment append, CRC, compression, fsync paths.
+  - `kafko_http_samply_bench.ps1` — **full HTTP request path.** Includes axum routing, hyper, tokio I/O, and kafko storage. Best for finding hot spots that involve the HTTP server itself.
 
 ### The 128 KiB cell
 
@@ -73,7 +78,8 @@ The thing we *can't* match is the **client implementation**: `oha` is Rust + tok
 
 - **Docker Desktop** (steady tray icon = daemon up) for everything except `kafko_http_bench.ps1`
 - **Rust toolchain** (`cargo`) for `kafko_http_bench.ps1`; the Docker bench builds Rust inside the image
-- **`oha`** on the host only for `kafko_http_bench.ps1` (`cargo install oha`). The Docker bench installs `oha` inside the image.
+- **`oha`** on the host only for `kafko_http_bench.ps1` and `kafko_http_samply_bench.ps1` (`cargo install oha`). The Docker bench installs `oha` inside the image.
+- **`samply`** for `kafko_http_samply_bench.ps1` only (`cargo install samply`). On Windows it captures via ETW; no admin rights needed for user-space programs.
 - **PowerShell 5.1+** (or PowerShell 7). Scripts are ASCII-only on purpose — PS 5.1 mis-decodes UTF-8-without-BOM as CP1252.
 
 ## Common knobs (edit at the top of each script)

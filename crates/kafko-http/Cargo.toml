@@ -10,4 +10,3 @@ kafko = { path = "../kafko" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 axum = "0.7"
 anyhow = "1"
-bytes = "1"

@@ -1,9 +1,18 @@
 use crate::compression::Compression;
 use crate::error::{KafkoError, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::cell::RefCell;
 
 const KEY_NULL_SENTINEL: u32 = u32::MAX;
 const MIN_TOTAL_LEN: usize = 4 + 1 + 8 + 4 + 4; // crc + flags + ts + key_len + val_len
+
+// Per-thread scratch buffer for the compressed-value bytes. Lives at thread scope so the
+// hot encode loop (one per partition writer task) reuses a single allocation across every
+// record it encodes — the buffer grows to the peak compressed size seen on that thread and
+// then stays there. Replaces the per-call Vec<u8> that Compression::compress used to return.
+thread_local! {
+    static ENCODE_COMPRESS_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
@@ -51,7 +60,28 @@ impl Record {
 
     /// Consumes `self` to enforce single-use. Compresses the value if `compression` is non-`None`.
     /// Returns the actual on-wire byte count appended to `out`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn encode_with(self, out: &mut BytesMut, compression: Compression) -> usize {
+        // The Compression::None branch is zero-copy: encode_inner reads val bytes straight
+        // from self.value. The compressed branches route the value through the per-thread
+        // scratch buffer so encode_inner sees an already-compressed &[u8] without ever
+        // materializing a fresh Vec<u8> on the hot path.
+        match compression {
+            Compression::None => self.encode_inner(out, compression, None),
+            Compression::Lz4 | Compression::Zstd => ENCODE_COMPRESS_SCRATCH.with(|s| {
+                let mut scratch = s.borrow_mut();
+                compression.compress(&self.value, &mut scratch);
+                self.encode_inner(out, compression, Some(&scratch[..]))
+            }),
+        }
+    }
+
+    fn encode_inner(
+        self,
+        out: &mut BytesMut,
+        compression: Compression,
+        val_bytes_override: Option<&[u8]>,
+    ) -> usize {
         // Wire layout written to `out` (all integers big-endian):
         //
         //   ┌─────────┬─────────┬───────┬─────────┬───────────┬──────────┬───────────┬──────────┐
@@ -68,14 +98,7 @@ impl Record {
         let start_len = out.len();
         let flag = compression.flag();
 
-        let val_compressed: Option<Vec<u8>> = match compression {
-            Compression::None => None,
-            Compression::Lz4 | Compression::Zstd => Some(compression.compress(&self.value)),
-        };
-        let val_bytes: &[u8] = match &val_compressed {
-            Some(v) => v,
-            None => &self.value,
-        };
+        let val_bytes: &[u8] = val_bytes_override.unwrap_or(&self.value);
 
         let key_part = match &self.key {
             None => 4,

@@ -67,6 +67,7 @@ impl Segment {
         self.size + additional as u64 > threshold
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn append(&mut self, bytes: &[u8]) -> Result<u64> {
         let file_pos = self.size;
         self.ensure_cursor(file_pos).await?;
@@ -100,6 +101,7 @@ impl Segment {
         Ok(())
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn sync(&mut self) -> Result<()> {
         self.file.sync_data().await?;
         Ok(())

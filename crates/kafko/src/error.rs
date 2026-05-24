@@ -41,3 +41,35 @@ pub enum KafkoError {
     #[error("partition writer task panicked: {payload}")]
     PartitionPanicked { payload: String },
 }
+
+// `std::io::Error` is not `Clone` in stable Rust, so we synthesize an equivalent
+// fresh `io::Error` carrying the same `ErrorKind` and the same display string.
+// Every other variant is trivially cloneable. Used by the partition writer to
+// fan one underlying batch failure out to every waiter that was coalesced into
+// that batch — without losing the error kind, which callers may want to match on
+// to decide whether the failure is transient (e.g. `StorageFull`) and worth a retry.
+impl Clone for KafkoError {
+    fn clone(&self) -> Self {
+        match self {
+            KafkoError::Io(e) => KafkoError::Io(std::io::Error::new(e.kind(), e.to_string())),
+            KafkoError::Truncated { needed } => KafkoError::Truncated { needed: *needed },
+            KafkoError::CrcMismatch { expected, actual } => KafkoError::CrcMismatch {
+                expected: *expected,
+                actual: *actual,
+            },
+            KafkoError::InvalidLength(n) => KafkoError::InvalidLength(*n),
+            KafkoError::Closed => KafkoError::Closed,
+            KafkoError::TopicAlreadyExists(s) => KafkoError::TopicAlreadyExists(s.clone()),
+            KafkoError::TopicNotFound(s) => KafkoError::TopicNotFound(s.clone()),
+            KafkoError::TopicInUse(s) => KafkoError::TopicInUse(s.clone()),
+            KafkoError::UnknownCompression(b) => KafkoError::UnknownCompression(*b),
+            KafkoError::DecompressionFailed => KafkoError::DecompressionFailed,
+            KafkoError::AlreadyOpen { path } => KafkoError::AlreadyOpen {
+                path: path.clone(),
+            },
+            KafkoError::PartitionPanicked { payload } => KafkoError::PartitionPanicked {
+                payload: payload.clone(),
+            },
+        }
+    }
+}

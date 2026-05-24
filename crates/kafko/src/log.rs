@@ -117,6 +117,7 @@ impl Log {
         self.segments.iter().map(|s| s.segment.size()).sum()
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn append(&mut self, record: Record) -> Result<u64> {
         let wire_size_estimate = record.wire_size();
         let compression = self.config.compression;
@@ -150,6 +151,7 @@ impl Log {
 
     /// Appends a batch of records in a single disk write. Returns the assigned offsets
     /// in order. Used by the partition actor to coalesce concurrent producer sends.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn append_batch(&mut self, records: Vec<Record>) -> Result<Vec<u64>> {
         if records.is_empty() {
             return Ok(Vec::new());
@@ -239,6 +241,7 @@ impl Log {
         Ok(None)
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn sync(&mut self) -> Result<()> {
         let active = self.segments.last_mut().unwrap();
         active.segment.sync().await?;
@@ -285,6 +288,7 @@ impl Log {
     /// and the OS's automatic writeback could leave the sealed segment with an
     /// unrecoverable truncated tail — and recovery wouldn't notice. Offset numbering
     /// would silently skip records that were already acked to the producer.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     async fn rotate_active_segment(&mut self) -> Result<()> {
         {
             let active = self.segments.last_mut().expect("segments invariant: never empty after create");

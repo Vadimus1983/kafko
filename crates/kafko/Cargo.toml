@@ -24,6 +24,15 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 thiserror = "2.0.18"
 zstd = "0.13"
 
+# Optional: per-function instrumentation profiler. Disabled by default so the
+# published library has zero dep weight. Enable via the `hotpath` feature only
+# from a downstream binary that wants to query metrics (e.g. crates/kafko-bench).
+hotpath = { version = "0.16.1", optional = true }
+
+[features]
+default = []
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
+
 [dev-dependencies]
 proptest = "1"
 criterion = { version = "0.5", features = ["async_tokio"] }
