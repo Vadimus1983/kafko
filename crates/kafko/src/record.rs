@@ -14,6 +14,13 @@ thread_local! {
     static ENCODE_COMPRESS_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// A single log entry: timestamp, optional key, value bytes.
+///
+/// Keys and values are [`Bytes`] so the producer can pass owned or zero-copy
+/// slices without an extra copy. Records returned by [`Consumer::next_record`]
+/// have decompressed values; the on-wire form is an internal detail.
+///
+/// [`Consumer::next_record`]: crate::Consumer::next_record
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     timestamp_ms: i64,
@@ -22,6 +29,11 @@ pub struct Record {
 }
 
 impl Record {
+    /// Constructs a record with the given timestamp (Unix epoch milliseconds),
+    /// optional key, and value. [`Producer::send`] is the usual entry point;
+    /// use this directly when you need to preserve a timestamp from upstream.
+    ///
+    /// [`Producer::send`]: crate::Producer::send
     pub fn new(timestamp_ms: i64, key: Option<Bytes>, value: Bytes) -> Self {
         Self {
             timestamp_ms,
@@ -30,14 +42,17 @@ impl Record {
         }
     }
 
+    /// Returns the record's timestamp in Unix epoch milliseconds.
     pub fn timestamp_ms(&self) -> i64 {
         self.timestamp_ms
     }
 
+    /// Returns the record's key, or `None` if it was produced without one.
     pub fn key(&self) -> Option<&Bytes> {
         self.key.as_ref()
     }
 
+    /// Returns the record's value bytes (decompressed if the topic uses a codec).
     pub fn value(&self) -> &Bytes {
         &self.value
     }
@@ -53,7 +68,8 @@ impl Record {
         4 + 4 + 1 + 8 + key_part + 4 + self.value.len()
     }
 
-    /// Equivalent to `encode_with(out, Compression::None)`.
+    /// Equivalent to `encode_with(out, Compression::None)`. Consumes `self`
+    /// to enforce single-use. Returns the on-wire byte count appended to `out`.
     pub fn encode(self, out: &mut BytesMut) -> usize {
         self.encode_with(out, Compression::None)
     }
@@ -133,6 +149,11 @@ impl Record {
         out.len() - start_len
     }
 
+    /// Decodes one record off the front of `buf`, advancing the slice past the
+    /// consumed bytes. Returns [`KafkoError::Truncated`] if `buf` is short,
+    /// [`KafkoError::CrcMismatch`] on corruption, [`KafkoError::InvalidLength`]
+    /// on a malformed header, or [`KafkoError::UnknownCompression`] /
+    /// [`KafkoError::DecompressionFailed`] on a codec issue.
     pub fn decode(buf: &mut &[u8]) -> Result<Self> {
         if buf.remaining() < 4 {
             return Err(KafkoError::Truncated {

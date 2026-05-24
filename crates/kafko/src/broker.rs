@@ -12,6 +12,19 @@ use tokio::sync::RwLock;
 
 const LOCK_FILENAME: &str = "LOCK";
 
+/// In-process log broker — owns topic registry, segment storage, and writer tasks.
+///
+/// Cloning is not supported by design: there is at most one `Kafko` per data
+/// directory (enforced by an OS-level advisory lock). Share access via
+/// [`Producer`] and [`Consumer`] handles obtained from [`producer_for`] /
+/// [`consumer_for`]; those are cheap to clone.
+///
+/// See [`Kafko::open`] for the typical entry point and [`shutdown`] for the
+/// durability boundary at the end of the broker's life.
+///
+/// [`producer_for`]: Kafko::producer_for
+/// [`consumer_for`]: Kafko::consumer_for
+/// [`shutdown`]: Kafko::shutdown
 pub struct Kafko {
     dir: PathBuf,
     topics: RwLock<HashMap<String, Arc<Partition>>>,
@@ -22,10 +35,42 @@ pub struct Kafko {
 }
 
 impl Kafko {
+    /// Opens (or creates) a kafko data directory and recovers any topics found
+    /// inside. Takes an OS-level exclusive lock on `<dir>/LOCK` for the broker's
+    /// lifetime, so a second `Kafko::open` on the same directory fails fast
+    /// with [`KafkoError::AlreadyOpen`].
+    ///
+    /// Uses [`LogConfig::default`] for any topic that has to be opened during
+    /// recovery; see [`open_with_config`] to override.
+    ///
+    /// [`open_with_config`]: Kafko::open_with_config
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use bytes::Bytes;
+    /// use kafko::Kafko;
+    ///
+    /// # async fn run() -> kafko::Result<()> {
+    /// let broker = Kafko::open("./data").await?;
+    /// broker.create_topic("orders").await?;
+    ///
+    /// let producer = broker.producer_for("orders").await?;
+    /// let offset = producer.send(None, Bytes::from("order-1")).await?;
+    /// println!("appended at offset {offset}");
+    ///
+    /// broker.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn open(dir: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_config(dir, LogConfig::default()).await
     }
 
+    /// Like [`Kafko::open`] but uses `default_log_config` as the default
+    /// [`LogConfig`] for topics created later via [`create_topic`].
+    ///
+    /// [`create_topic`]: Kafko::create_topic
     pub async fn open_with_config(
         dir: impl AsRef<Path>,
         default_log_config: LogConfig,
@@ -58,19 +103,31 @@ impl Kafko {
         })
     }
 
+    /// Returns the data directory this broker was opened against.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
+    /// Returns the [`LogConfig`] used as the default for topics created via
+    /// [`create_topic`].
+    ///
+    /// [`create_topic`]: Kafko::create_topic
     pub fn default_log_config(&self) -> &LogConfig {
         &self.default_log_config
     }
 
+    /// Creates a new topic under the broker's data directory using the broker's
+    /// default [`LogConfig`]. Errors with [`KafkoError::TopicAlreadyExists`] if
+    /// the topic already exists.
     pub async fn create_topic(&self, name: &str) -> Result<()> {
         self.create_topic_with_config(name, self.default_log_config)
             .await
     }
 
+    /// Like [`create_topic`] but accepts an explicit [`LogConfig`] (compression,
+    /// segment size, retention) for the new topic.
+    ///
+    /// [`create_topic`]: Kafko::create_topic
     pub async fn create_topic_with_config(&self, name: &str, log_config: LogConfig) -> Result<()> {
         let mut topics = self.topics.write().await;
         if topics.contains_key(name) {
@@ -82,6 +139,11 @@ impl Kafko {
         Ok(())
     }
 
+    /// Removes a topic and deletes its segment files from disk. Fails with
+    /// [`KafkoError::TopicNotFound`] if the topic doesn't exist, or
+    /// [`KafkoError::TopicInUse`] if outstanding [`Producer`] / [`Consumer`]
+    /// handles for the topic still exist (the registry is restored on that
+    /// path so the caller can drop those handles and retry).
     pub async fn delete_topic(&self, name: &str) -> Result<()> {
         let mut topics = self.topics.write().await;
         let partition = match topics.remove(name) {
@@ -104,20 +166,32 @@ impl Kafko {
         }
     }
 
+    /// Returns the names of all currently-open topics, sorted lexicographically.
     pub async fn list_topics(&self) -> Vec<String> {
         let mut names: Vec<String> = self.topics.read().await.keys().cloned().collect();
         names.sort();
         names
     }
 
+    /// Returns whether the named topic is currently open on this broker.
     pub async fn has_topic(&self, name: &str) -> bool {
         self.topics.read().await.contains_key(name)
     }
 
+    /// Returns a shared handle to the named topic's [`Partition`], or `None`
+    /// if no such topic exists. Most callers want [`producer_for`] /
+    /// [`consumer_for`] instead; this is for callers that need to observe the
+    /// partition's high-water-mark directly.
+    ///
+    /// [`producer_for`]: Kafko::producer_for
+    /// [`consumer_for`]: Kafko::consumer_for
     pub async fn topic(&self, name: &str) -> Option<Arc<Partition>> {
         self.topics.read().await.get(name).cloned()
     }
 
+    /// Returns a [`Producer`] bound to the named topic. Producers are cheap to
+    /// clone and share. Errors with [`KafkoError::TopicNotFound`] if the topic
+    /// doesn't exist.
     pub async fn producer_for(&self, name: &str) -> Result<Producer> {
         let partition = self
             .topic(name)
@@ -126,6 +200,9 @@ impl Kafko {
         Ok(Producer::new(partition))
     }
 
+    /// Returns a [`Consumer`] positioned at offset 0 of the named topic. Call
+    /// [`Consumer::seek`] to start from a different offset. Errors with
+    /// [`KafkoError::TopicNotFound`] if the topic doesn't exist.
     pub async fn consumer_for(&self, name: &str) -> Result<Consumer> {
         let partition = self
             .topic(name)

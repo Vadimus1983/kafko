@@ -13,11 +13,24 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+/// Per-topic value compression.
+///
+/// Set at topic creation via [`LogConfig::compression`]. The compression flag
+/// is encoded in each record's header, so a single topic can be decoded
+/// correctly even if the broker's configured codec changes between runs.
+///
+/// See the README "Codec note" for the per-call allocation behaviour of LZ4
+/// vs zstd.
+///
+/// [`LogConfig::compression`]: crate::LogConfig::compression
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Compression {
+    /// No compression — record payloads are written verbatim.
     #[default]
     None,
+    /// LZ4 block compression via [`lz4_flex`].
     Lz4,
+    /// Zstandard compression at level 3 via the [`zstd`] crate.
     Zstd,
 }
 

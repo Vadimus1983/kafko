@@ -7,15 +7,37 @@ use bytes::BytesMut;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Per-topic configuration for a partition's on-disk log.
+///
+/// Passed to [`Kafko::create_topic_with_config`] / [`Kafko::open_with_config`].
+/// `LogConfig::default()` gives reasonable values for general-purpose use;
+/// override individual fields when your workload needs different sizing or
+/// retention.
+///
+/// [`Kafko::create_topic_with_config`]: crate::Kafko::create_topic_with_config
+/// [`Kafko::open_with_config`]: crate::Kafko::open_with_config
 #[derive(Clone, Copy, Debug)]
 pub struct LogConfig {
+    /// Maximum size of a single segment file in bytes before rotation.
+    /// Default: 1 GiB.
     pub segment_size_threshold: u64,
+    /// Bytes between sparse-index entries. Smaller values speed up
+    /// random-offset reads; larger values shrink the index file. Default: 4 KiB.
     pub index_interval: u64,
+    /// Maximum age of a sealed segment before retention deletes it. `None`
+    /// disables age-based retention. Default: `None`.
     pub max_segment_age: Option<Duration>,
+    /// Maximum total disk usage per partition before retention starts deleting
+    /// the oldest sealed segments. `None` disables byte-based retention. Default: `None`.
     pub max_partition_bytes: Option<u64>,
+    /// How often the writer task runs the retention sweep. Default: 60 s.
     pub retention_check_interval: Duration,
+    /// Maximum records per natural-batch flush from the writer task's inbox.
+    /// Larger values let producers ride more aggressive coalescing. Default: 1024.
     pub batch_max_records: usize,
+    /// Maximum bytes per natural-batch flush. Default: 64 KiB.
     pub batch_max_bytes: u64,
+    /// Compression codec applied to record values on this topic.
     pub compression: Compression,
 }
 
@@ -34,6 +56,15 @@ impl Default for LogConfig {
     }
 }
 
+/// Append-only segment log backing one [`Partition`].
+///
+/// Owns the ordered list of [`Segment`] files and their [`SparseIndex`]es plus
+/// the next-offset cursor. Not used directly by most callers — [`Partition`]
+/// wraps a `Log` and serializes access to it via its writer task.
+///
+/// [`Partition`]: crate::Partition
+/// [`Segment`]: crate::Segment
+/// [`SparseIndex`]: crate::SparseIndex
 pub struct Log {
     dir: PathBuf,
     config: LogConfig,
@@ -53,6 +84,8 @@ struct IndexedSegment {
 }
 
 impl Log {
+    /// Creates a fresh `Log` (no existing segments) at `dir`. Errors if the
+    /// directory already contains a segment file.
     pub async fn create(dir: &Path, config: LogConfig) -> Result<Self> {
         tokio::fs::create_dir_all(dir).await?;
         let segment = Segment::create(dir, 0).await?;
@@ -107,26 +140,34 @@ impl Log {
         })
     }
 
+    /// Returns the directory this log was opened against.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
+    /// Returns the [`LogConfig`] this log was opened with.
     pub fn config(&self) -> &LogConfig {
         &self.config
     }
 
+    /// Returns the offset that will be assigned to the next appended record.
     pub fn next_offset(&self) -> u64 {
         self.next_offset
     }
 
+    /// Returns the number of segments currently in the log (sealed + active).
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
 
+    /// Returns the sum of all segment sizes in bytes — i.e., the on-disk
+    /// footprint of this log's `.log` files (excluding the `.index` files).
     pub fn total_size(&self) -> u64 {
         self.segments.iter().map(|s| s.segment.size()).sum()
     }
 
+    /// Appends a single record and returns its assigned offset. Rotates the
+    /// active segment first if the record would push it past the size threshold.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn append(&mut self, record: Record) -> Result<u64> {
         let wire_size_estimate = record.wire_size();
@@ -213,6 +254,9 @@ impl Log {
         Ok(offsets)
     }
 
+    /// Reads the record at `offset`, returning `Ok(None)` if the offset is past
+    /// the high-water-mark. Locates the containing segment via the sparse
+    /// index, then decodes forward to the requested offset.
     pub async fn read_record_at(&mut self, offset: u64) -> Result<Option<Record>> {
         if offset >= self.next_offset {
             return Ok(None);
@@ -249,6 +293,8 @@ impl Log {
         Ok(None)
     }
 
+    /// Fsyncs the active segment and its sparse index. Returns only after the
+    /// kernel reports the writes are on disk.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn sync(&mut self) -> Result<()> {
         let active = self

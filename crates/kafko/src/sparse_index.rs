@@ -7,6 +7,15 @@ const FILENAME_DIGITS: usize = 20;
 const FILENAME_EXTENSION: &str = "index";
 const ENTRY_SIZE: usize = 8;
 
+/// On-disk sparse offset index mapping `record offset → file position`.
+///
+/// One entry every `interval` bytes (configured via [`LogConfig::index_interval`]),
+/// so lookups locate the closest indexed offset at or before the target and
+/// the caller decodes forward from there. Used by [`Log::read_record_at`] to
+/// avoid scanning a full segment.
+///
+/// [`LogConfig::index_interval`]: crate::LogConfig::index_interval
+/// [`Log::read_record_at`]: crate::Log::read_record_at
 pub struct SparseIndex {
     base_offset: u64,
     path: PathBuf,
@@ -22,6 +31,8 @@ struct IndexEntry {
 }
 
 impl SparseIndex {
+    /// Creates a fresh empty index file at `dir/<base_offset>.index`. Errors
+    /// if a file at that path already exists.
     pub async fn create(dir: &Path, base_offset: u64, interval: u64) -> Result<Self> {
         let path = index_path(dir, base_offset);
         let file = OpenOptions::new()
@@ -38,6 +49,8 @@ impl SparseIndex {
         })
     }
 
+    /// Opens an existing index file at `dir/<base_offset>.index` and loads its
+    /// entries into memory. Errors if the file is missing.
     pub async fn open(dir: &Path, base_offset: u64, interval: u64) -> Result<Self> {
         let path = index_path(dir, base_offset);
         let bytes = std::fs::read(&path)?;
@@ -69,26 +82,36 @@ impl SparseIndex {
         })
     }
 
+    /// Returns the absolute offset of the first record in the segment this
+    /// index covers.
     pub fn base_offset(&self) -> u64 {
         self.base_offset
     }
 
+    /// Returns the path of the underlying `.index` file.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Returns the configured bytes-between-entries interval.
     pub fn interval(&self) -> u64 {
         self.interval
     }
 
+    /// Returns the number of entries currently in the index.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Returns true if the index has no entries yet.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// Records that a record at `absolute_offset` was just appended at
+    /// `file_position`, occupying `record_size` bytes. Adds an index entry if
+    /// the running byte count since the last entry exceeds `interval` (or if
+    /// this is the first entry).
     pub async fn track_append(
         &mut self,
         absolute_offset: u64,
@@ -149,6 +172,7 @@ impl SparseIndex {
         }
     }
 
+    /// Fsyncs the index file to disk via `sync_data`.
     pub async fn sync(&mut self) -> Result<()> {
         self.file.sync_data()?;
         Ok(())

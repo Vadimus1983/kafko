@@ -6,6 +6,12 @@ use std::path::{Path, PathBuf};
 const FILENAME_DIGITS: usize = 20;
 const FILENAME_EXTENSION: &str = "log";
 
+/// One on-disk `.log` segment file plus its in-memory append cursor.
+///
+/// Segments are owned exclusively by their partition's writer task; the
+/// `cursor` optimization (see field doc) depends on that single-writer
+/// invariant. Callers should not construct or operate on `Segment` directly —
+/// it's exposed for downstream tools that want to read raw segments.
 pub struct Segment {
     base_offset: u64,
     path: PathBuf,
@@ -25,6 +31,8 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// Creates a fresh empty segment file at `dir/<base_offset>.log`. Errors
+    /// if a file at that path already exists.
     pub async fn create(dir: &Path, base_offset: u64) -> Result<Self> {
         let path = segment_path(dir, base_offset);
         let file = OpenOptions::new()
@@ -41,6 +49,8 @@ impl Segment {
         })
     }
 
+    /// Opens an existing segment file at `dir/<base_offset>.log`. Errors if
+    /// the file is missing.
     pub async fn open(dir: &Path, base_offset: u64) -> Result<Self> {
         let path = segment_path(dir, base_offset);
         let metadata = std::fs::metadata(&path)?;
@@ -54,22 +64,31 @@ impl Segment {
         })
     }
 
+    /// Returns the absolute offset of the first record in this segment.
     pub fn base_offset(&self) -> u64 {
         self.base_offset
     }
 
+    /// Returns the path of the underlying `.log` file.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Returns the current size of the segment file in bytes.
     pub fn size(&self) -> u64 {
         self.size
     }
 
+    /// Returns true if appending `additional` bytes would push this segment
+    /// past `threshold`. Used by [`Log`] to decide when to rotate.
+    ///
+    /// [`Log`]: crate::Log
     pub fn would_overflow(&self, additional: usize, threshold: u64) -> bool {
         self.size + additional as u64 > threshold
     }
 
+    /// Appends `bytes` at the end of the segment file and returns the file
+    /// position where the write started (i.e. the segment-relative offset).
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn append(&mut self, bytes: &[u8]) -> Result<u64> {
         let file_pos = self.size;
@@ -80,6 +99,8 @@ impl Segment {
         Ok(file_pos)
     }
 
+    /// Reads bytes from `file_pos` into `into`, returning the number of bytes
+    /// actually read. Short reads are possible at EOF.
     pub async fn read_at(&mut self, file_pos: u64, into: &mut [u8]) -> Result<usize> {
         self.ensure_cursor(file_pos)?;
         let n = self.file.read(into)?;
@@ -87,6 +108,8 @@ impl Segment {
         Ok(n)
     }
 
+    /// Truncates the segment to `new_size` bytes and fsyncs. Used by the
+    /// recovery path to drop torn or corrupted records at the tail.
     pub async fn truncate(&mut self, new_size: u64) -> Result<()> {
         self.file.set_len(new_size)?;
         self.file.sync_data()?;
@@ -104,12 +127,16 @@ impl Segment {
         Ok(())
     }
 
+    /// Fsyncs the segment file to disk via `sync_data` (durable data, metadata
+    /// may lag).
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn sync(&mut self) -> Result<()> {
         self.file.sync_data()?;
         Ok(())
     }
 
+    /// Returns the segment file's last-modified time in Unix epoch milliseconds.
+    /// Used by age-based retention.
     pub async fn last_modified_ms(&self) -> Result<i64> {
         let metadata = std::fs::metadata(&self.path)?;
         let modified = metadata.modified()?;

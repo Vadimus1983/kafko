@@ -8,6 +8,13 @@ use tokio::task::JoinHandle;
 
 const INBOX_CAPACITY: usize = 1024;
 
+/// Single-partition log with its own writer task.
+///
+/// Owns one [`Log`] (segments + sparse index) and a single writer task that
+/// serializes all appends — the single-writer-per-partition invariant.
+/// Producers and consumers communicate with the writer via an `mpsc` inbox;
+/// the writer publishes the partition's high-water-mark on a `watch` channel
+/// so consumers can wait for new data without polling.
 pub struct Partition {
     inbox: mpsc::Sender<PartitionCommand>,
     hwm_rx: watch::Receiver<u64>,
@@ -42,6 +49,10 @@ enum PartitionCommand {
 }
 
 impl Partition {
+    /// Opens (or recovers) a partition rooted at `dir` and spawns its writer task.
+    /// Usually called by [`Kafko`] rather than directly.
+    ///
+    /// [`Kafko`]: crate::Kafko
     pub async fn open(dir: &Path, config: LogConfig) -> Result<Self> {
         let log = Log::open(dir, config).await?;
         let initial_hwm = log.next_offset();
@@ -77,6 +88,10 @@ impl Partition {
         })
     }
 
+    /// Appends a single record and returns its assigned offset. Producers
+    /// usually call this via [`Producer::send`] rather than directly.
+    ///
+    /// [`Producer::send`]: crate::Producer::send
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn append(&self, record: Record) -> Result<u64> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -97,6 +112,11 @@ impl Partition {
         }
     }
 
+    /// Reads the record at `offset`, returning `Ok(None)` if `offset` is past
+    /// the current high-water-mark. Consumers usually call this via
+    /// [`Consumer::next_record`] rather than directly.
+    ///
+    /// [`Consumer::next_record`]: crate::Consumer::next_record
     pub async fn read_record_at(&self, offset: u64) -> Result<Option<Record>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -116,6 +136,9 @@ impl Partition {
         }
     }
 
+    /// Forces the active segment + index to be fsynced to disk. Resolves only
+    /// after the kernel reports the syscall complete. Use this when you need
+    /// a hard durability point without shutting the broker down.
     pub async fn sync(&self) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -132,10 +155,18 @@ impl Partition {
         }
     }
 
+    /// Returns the offset of the next record this partition will assign — i.e.,
+    /// `last_assigned_offset + 1`, or 0 for an empty partition.
     pub fn high_water_mark(&self) -> u64 {
         *self.hwm_rx.borrow()
     }
 
+    /// Returns a [`watch::Receiver`] that updates whenever a new record is
+    /// appended. Useful for building consumers or back-pressure logic without
+    /// polling [`high_water_mark`].
+    ///
+    /// [`watch::Receiver`]: tokio::sync::watch::Receiver
+    /// [`high_water_mark`]: Partition::high_water_mark
     pub fn watch_high_water_mark(&self) -> watch::Receiver<u64> {
         self.hwm_rx.clone()
     }
@@ -190,6 +221,12 @@ impl Partition {
         Ok(())
     }
 
+    /// Gracefully shuts the partition's writer task down: drains the inbox,
+    /// fsyncs the active segment + index, and exits. Resolves only after the
+    /// final fsync completes. Usually called by [`Kafko::shutdown`] rather
+    /// than directly.
+    ///
+    /// [`Kafko::shutdown`]: crate::Kafko::shutdown
     pub async fn shutdown(self) -> Result<()> {
         drop(self.inbox);
         // Awaiting the supervisor instead of the writer task directly: the
