@@ -7,8 +7,7 @@ use fs4::fs_std::FileExt;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 const LOCK_FILENAME: &str = "LOCK";
 
@@ -19,14 +18,19 @@ const LOCK_FILENAME: &str = "LOCK";
 /// [`Producer`] and [`Consumer`] handles obtained from [`producer_for`] /
 /// [`consumer_for`]; those are cheap to clone.
 ///
-/// See [`Kafko::open`] for the typical entry point and [`shutdown`] for the
-/// durability boundary at the end of the broker's life.
+/// Dropping a `Kafko` without first calling [`shutdown`] still attempts a
+/// graceful shutdown — see the [`Drop`](#impl-Drop-for-Kafko) impl for the
+/// exact contract — but explicit [`shutdown`] gives you error visibility and
+/// works on any tokio runtime flavor.
 ///
 /// [`producer_for`]: Kafko::producer_for
 /// [`consumer_for`]: Kafko::consumer_for
 /// [`shutdown`]: Kafko::shutdown
 pub struct Kafko {
     dir: PathBuf,
+    // std::sync::RwLock (not tokio::sync) so Drop can `get_mut()` the registry
+    // synchronously. Touched only on admin / handle-binding paths, never on the
+    // record hot path; there is no perf cost to blocking-locks here.
     topics: RwLock<HashMap<String, Arc<Partition>>>,
     default_log_config: LogConfig,
     // Held for the broker's lifetime. Dropping the File releases the OS-level
@@ -129,12 +133,22 @@ impl Kafko {
     ///
     /// [`create_topic`]: Kafko::create_topic
     pub async fn create_topic_with_config(&self, name: &str, log_config: LogConfig) -> Result<()> {
-        let mut topics = self.topics.write().await;
-        if topics.contains_key(name) {
-            return Err(KafkoError::TopicAlreadyExists(name.to_string()));
+        // Check existence + reserve under the write lock; release before the async
+        // Partition::open so we don't hold the lock across an .await.
+        {
+            let topics = self.topics.read().expect("topics RwLock poisoned");
+            if topics.contains_key(name) {
+                return Err(KafkoError::TopicAlreadyExists(name.to_string()));
+            }
         }
         let topic_dir = self.dir.join(name);
         let partition = Partition::open(&topic_dir, log_config).await?;
+
+        let mut topics = self.topics.write().expect("topics RwLock poisoned");
+        if topics.contains_key(name) {
+            // Lost a race; another caller created the same topic in between.
+            return Err(KafkoError::TopicAlreadyExists(name.to_string()));
+        }
         topics.insert(name.to_string(), Arc::new(partition));
         Ok(())
     }
@@ -145,10 +159,12 @@ impl Kafko {
     /// handles for the topic still exist (the registry is restored on that
     /// path so the caller can drop those handles and retry).
     pub async fn delete_topic(&self, name: &str) -> Result<()> {
-        let mut topics = self.topics.write().await;
-        let partition = match topics.remove(name) {
-            Some(p) => p,
-            None => return Err(KafkoError::TopicNotFound(name.to_string())),
+        let partition = {
+            let mut topics = self.topics.write().expect("topics RwLock poisoned");
+            match topics.remove(name) {
+                Some(p) => p,
+                None => return Err(KafkoError::TopicNotFound(name.to_string())),
+            }
         };
 
         match Arc::try_unwrap(partition) {
@@ -160,7 +176,10 @@ impl Kafko {
             }
             Err(arc) => {
                 // External refs exist; restore registry state and report.
-                topics.insert(name.to_string(), arc);
+                self.topics
+                    .write()
+                    .expect("topics RwLock poisoned")
+                    .insert(name.to_string(), arc);
                 Err(KafkoError::TopicInUse(name.to_string()))
             }
         }
@@ -168,14 +187,23 @@ impl Kafko {
 
     /// Returns the names of all currently-open topics, sorted lexicographically.
     pub async fn list_topics(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.topics.read().await.keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .topics
+            .read()
+            .expect("topics RwLock poisoned")
+            .keys()
+            .cloned()
+            .collect();
         names.sort();
         names
     }
 
     /// Returns whether the named topic is currently open on this broker.
     pub async fn has_topic(&self, name: &str) -> bool {
-        self.topics.read().await.contains_key(name)
+        self.topics
+            .read()
+            .expect("topics RwLock poisoned")
+            .contains_key(name)
     }
 
     /// Returns a shared handle to the named topic's [`Partition`], or `None`
@@ -186,7 +214,11 @@ impl Kafko {
     /// [`producer_for`]: Kafko::producer_for
     /// [`consumer_for`]: Kafko::consumer_for
     pub async fn topic(&self, name: &str) -> Option<Arc<Partition>> {
-        self.topics.read().await.get(name).cloned()
+        self.topics
+            .read()
+            .expect("topics RwLock poisoned")
+            .get(name)
+            .cloned()
     }
 
     /// Returns a [`Producer`] bound to the named topic. Producers are cheap to
@@ -216,6 +248,13 @@ impl Kafko {
     /// released last. Returns only after every previously-acked record is on
     /// disk and not just in OS page cache.
     ///
+    /// Prefer this over relying on [`Drop`](#impl-Drop-for-Kafko) when:
+    /// - your runtime is the `current_thread` flavor (Drop can't block there
+    ///   and falls back to a detached task that may be aborted by runtime
+    ///   shutdown),
+    /// - you want to observe shutdown errors (Drop swallows them), or
+    /// - you need a deterministic shutdown point in your program flow.
+    ///
     /// Host applications that care about durability across `SIGTERM` / `SIGINT`
     /// / `docker stop` should install a signal handler that drives this method
     /// to completion before the process exits. `SIGKILL`, OS panic, and power
@@ -223,19 +262,81 @@ impl Kafko {
     /// cases the recovery path at next `Kafko::open` handles torn writes via
     /// CRC scan, but any record whose page-cache bytes had not yet been
     /// flushed by the kernel may be lost.
-    ///
-    /// Letting the broker simply go out of scope (no `shutdown().await`)
-    /// releases the lock but does NOT guarantee that recently-acked records
-    /// are fsynced — the writer tasks are aborted by tokio runtime shutdown.
-    pub async fn shutdown(self) -> Result<()> {
-        let topics = self.topics.into_inner();
-        for (_, partition) in topics {
-            if let Ok(owned) = Arc::try_unwrap(partition) {
-                let _ = owned.shutdown().await;
+    pub async fn shutdown(mut self) -> Result<()> {
+        let topics = std::mem::take(self.topics.get_mut().expect("topics RwLock poisoned"));
+        shutdown_partitions(topics).await;
+        // `Drop::drop` will run next on self, but `topics` is now empty so the
+        // Drop impl is a no-op. `_dir_lock` drops at the end of Drop, releasing
+        // the advisory lock.
+        Ok(())
+    }
+}
+
+/// Best-effort graceful shutdown when the broker goes out of scope without an
+/// explicit [`Kafko::shutdown`].
+///
+/// Behavior depends on whether a tokio runtime is reachable from the dropping
+/// thread:
+///
+/// - **Multi-thread runtime (default `#[tokio::main]`):** drives every
+///   partition's writer task to completion before `Drop` returns. The data
+///   directory lock is released only after the final fsync. Effectively the
+///   same durability as explicit [`shutdown`](Kafko::shutdown), minus error
+///   visibility.
+/// - **Current-thread runtime:** spawns the cleanup task detached. It may or
+///   may not complete before the runtime tears down. Use explicit
+///   [`shutdown`](Kafko::shutdown) instead if you need guarantees.
+/// - **No runtime reachable:** drops the directory lock and lets the writer
+///   tasks be aborted by whatever owns the runtime they were spawned on.
+///
+/// Errors during shutdown are silently swallowed because `Drop` cannot return
+/// a `Result`. Call [`shutdown`](Kafko::shutdown) explicitly if you need to
+/// observe them.
+impl Drop for Kafko {
+    fn drop(&mut self) {
+        let topics = std::mem::take(self.topics.get_mut().expect("topics RwLock poisoned"));
+        if topics.is_empty() {
+            // Already shut down explicitly, or never had any topics.
+            return;
+        }
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // No reachable runtime — the spawned writer tasks belong to some
+            // runtime that's either dead or unreachable. Nothing useful to do
+            // here; the dir lock drops with self._dir_lock below.
+            return;
+        };
+
+        let cleanup = shutdown_partitions(topics);
+
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::CurrentThread => {
+                // block_in_place panics on the current-thread runtime, so we
+                // fall back to a detached cleanup task. Best-effort: if the
+                // runtime is itself shutting down (typical Drop-at-end-of-main),
+                // the task may not finish before its host runtime aborts it.
+                handle.spawn(cleanup);
+            }
+            _ => {
+                // Multi-thread runtime: tell tokio to let the other workers
+                // continue with our pending work while we drive the cleanup
+                // future to completion on this thread.
+                tokio::task::block_in_place(|| handle.block_on(cleanup));
             }
         }
-        // _dir_lock drops here, releasing the advisory lock.
-        Ok(())
+        // self._dir_lock drops here, releasing the advisory lock.
+    }
+}
+
+/// Shared cleanup helper: takes ownership of the topics map and drives each
+/// partition's `shutdown()` to completion. Partitions whose `Arc` still has
+/// external producer/consumer references are skipped (their writer tasks keep
+/// running until those handles also drop).
+async fn shutdown_partitions(topics: HashMap<String, Arc<Partition>>) {
+    for (_, partition) in topics {
+        if let Ok(owned) = Arc::try_unwrap(partition) {
+            let _ = owned.shutdown().await;
+        }
     }
 }
 

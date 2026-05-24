@@ -262,6 +262,47 @@ async fn lock_file_persists_across_open_cycles() {
     let _broker = Kafko::open(dir.path()).await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drop_without_shutdown_still_fsyncs_on_multi_thread_runtime() {
+    // Mirrors `shutdown_is_a_durability_boundary_for_acked_records` but exits
+    // the inner scope by simply letting the broker drop, no explicit shutdown.
+    // The Drop impl on the multi-thread runtime uses block_in_place + block_on
+    // to drive the writer-task shutdown to completion, so this must still see
+    // every acked record after reopen.
+    let dir = TempDir::new().unwrap();
+    let record_count: u64 = 256;
+
+    {
+        let broker = Kafko::open(dir.path()).await.unwrap();
+        broker.create_topic("orders").await.unwrap();
+        let producer = broker.producer_for("orders").await.unwrap();
+        for i in 0..record_count {
+            producer
+                .send(None, Bytes::from(format!("rec-{i}")))
+                .await
+                .unwrap();
+        }
+        // Producer dropped first (loses its Arc<Partition> ref); broker drops
+        // at end of scope, triggering the Drop impl's block_in_place path.
+    }
+
+    let broker = Kafko::open(dir.path()).await.unwrap();
+    let mut consumer = broker.consumer_for("orders").await.unwrap();
+    consumer.seek(0);
+    for i in 0..record_count {
+        let r = consumer
+            .next_record()
+            .await
+            .unwrap_or_else(|e| panic!("missing record at {i}: {e:?}"));
+        let expected = format!("rec-{i}");
+        assert_eq!(
+            r.value().as_ref(),
+            expected.as_bytes(),
+            "wrong value at offset {i} after drop+reopen"
+        );
+    }
+}
+
 #[tokio::test]
 async fn shutdown_is_a_durability_boundary_for_acked_records() {
     let dir = TempDir::new().unwrap();

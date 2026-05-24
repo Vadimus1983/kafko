@@ -1,4 +1,5 @@
 #![deny(missing_docs)]
+#![deny(clippy::await_holding_lock)]
 //! In-process log with Kafka-like semantics for Rust.
 //!
 //! kafko exists for use cases where your data never needs to leave the

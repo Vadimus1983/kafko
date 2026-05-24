@@ -129,9 +129,15 @@ tokio::signal::ctrl_c().await.ok();
 broker.shutdown().await?;
 ```
 
-`SIGKILL`, OS panic, and power loss bypass userspace and cannot be intercepted; the recovery path on the next `Kafko::open` handles torn tails via CRC scan, but any record whose page-cache bytes had not yet been written back by the kernel may be lost. Letting the broker drop without calling `shutdown` releases the data-directory lock but does NOT guarantee a final fsync.
+`SIGKILL`, OS panic, and power loss bypass userspace and cannot be intercepted; the recovery path on the next `Kafko::open` handles torn tails via CRC scan, but any record whose page-cache bytes had not yet been written back by the kernel may be lost.
 
-This contract is identical to what Kafka calls `acks=1` and is the *fair* comparison shape for the benchmarks below. If you need `acks=all`-style multi-replica durability, kafko is not the right tool — use Kafka.
+**Drop-without-shutdown fallback.** If you let the broker go out of scope without calling `shutdown()`, kafko's `Drop` impl runs the same graceful shutdown as a best-effort fallback:
+
+- On a **multi-thread tokio runtime** (the default `#[tokio::main]`), Drop uses `block_in_place` + `block_on` to drive every partition's writer task to completion before returning. Durability is identical to explicit `shutdown()`; you just lose the ability to observe any error it might have returned.
+- On a **current-thread runtime**, Drop can't safely block — it spawns the cleanup detached and may not complete before runtime teardown. Call `shutdown().await` explicitly in this case.
+- With **no reachable tokio runtime**, Drop releases the directory lock and lets the writer tasks die with their host runtime.
+
+This contract is identical to what Kafka calls `acks=1`. If you need `acks=all`-style multi-replica durability, kafko is not the right tool — use Kafka.
 
 ## Benchmarks
 
