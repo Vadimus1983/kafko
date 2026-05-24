@@ -1,8 +1,7 @@
 use crate::error::Result;
-use std::io::SeekFrom;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 const FILENAME_DIGITS: usize = 20;
 const FILENAME_EXTENSION: &str = "log";
@@ -23,8 +22,7 @@ impl Segment {
             .create_new(true)
             .read(true)
             .write(true)
-            .open(&path)
-            .await?;
+            .open(&path)?;
         Ok(Self {
             base_offset,
             path,
@@ -36,12 +34,8 @@ impl Segment {
 
     pub async fn open(dir: &Path, base_offset: u64) -> Result<Self> {
         let path = segment_path(dir, base_offset);
-        let metadata = tokio::fs::metadata(&path).await?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await?;
+        let metadata = std::fs::metadata(&path)?;
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
         Ok(Self {
             base_offset,
             path,
@@ -70,32 +64,32 @@ impl Segment {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn append(&mut self, bytes: &[u8]) -> Result<u64> {
         let file_pos = self.size;
-        self.ensure_cursor(file_pos).await?;
-        self.file.write_all(bytes).await?;
+        self.ensure_cursor(file_pos)?;
+        self.file.write_all(bytes)?;
         self.cursor = Some(file_pos + bytes.len() as u64);
         self.size = file_pos + bytes.len() as u64;
         Ok(file_pos)
     }
 
     pub async fn read_at(&mut self, file_pos: u64, into: &mut [u8]) -> Result<usize> {
-        self.ensure_cursor(file_pos).await?;
-        let n = self.file.read(into).await?;
+        self.ensure_cursor(file_pos)?;
+        let n = self.file.read(into)?;
         self.cursor = Some(file_pos + n as u64);
         Ok(n)
     }
 
     pub async fn truncate(&mut self, new_size: u64) -> Result<()> {
-        self.file.set_len(new_size).await?;
-        self.file.sync_data().await?;
+        self.file.set_len(new_size)?;
+        self.file.sync_data()?;
         self.size = new_size;
         // truncate may leave cursor past EOF on some platforms; force re-seek next op
         self.cursor = None;
         Ok(())
     }
 
-    async fn ensure_cursor(&mut self, pos: u64) -> Result<()> {
+    fn ensure_cursor(&mut self, pos: u64) -> Result<()> {
         if self.cursor != Some(pos) {
-            self.file.seek(SeekFrom::Start(pos)).await?;
+            self.file.seek(SeekFrom::Start(pos))?;
             self.cursor = Some(pos);
         }
         Ok(())
@@ -103,12 +97,12 @@ impl Segment {
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn sync(&mut self) -> Result<()> {
-        self.file.sync_data().await?;
+        self.file.sync_data()?;
         Ok(())
     }
 
     pub async fn last_modified_ms(&self) -> Result<i64> {
-        let metadata = tokio::fs::metadata(&self.path).await?;
+        let metadata = std::fs::metadata(&self.path)?;
         let modified = metadata.modified()?;
         let ms = modified
             .duration_since(std::time::UNIX_EPOCH)

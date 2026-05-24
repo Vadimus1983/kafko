@@ -1,7 +1,7 @@
 use crate::error::Result;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use tokio::fs::{File, OpenOptions};
-use tokio::io::AsyncWriteExt;
 
 const FILENAME_DIGITS: usize = 20;
 const FILENAME_EXTENSION: &str = "index";
@@ -27,8 +27,7 @@ impl SparseIndex {
         let file = OpenOptions::new()
             .create_new(true)
             .append(true)
-            .open(&path)
-            .await?;
+            .open(&path)?;
         Ok(Self {
             base_offset,
             path,
@@ -41,7 +40,7 @@ impl SparseIndex {
 
     pub async fn open(dir: &Path, base_offset: u64, interval: u64) -> Result<Self> {
         let path = index_path(dir, base_offset);
-        let bytes = tokio::fs::read(&path).await?;
+        let bytes = std::fs::read(&path)?;
         let mut entries = Vec::with_capacity(bytes.len() / ENTRY_SIZE);
         for chunk in bytes.chunks_exact(ENTRY_SIZE) {
             let relative_offset = u32::from_be_bytes(chunk[0..4].try_into().unwrap());
@@ -51,7 +50,7 @@ impl SparseIndex {
                 file_position,
             });
         }
-        let file = OpenOptions::new().append(true).open(&path).await?;
+        let file = OpenOptions::new().append(true).open(&path)?;
         Ok(Self {
             base_offset,
             path,
@@ -100,7 +99,7 @@ impl SparseIndex {
                 relative_offset,
                 file_position: file_position_u32,
             };
-            self.write_entry(&entry).await?;
+            self.write_entry(&entry)?;
             self.entries.push(entry);
             self.bytes_since_last_entry = 0;
         }
@@ -143,15 +142,15 @@ impl SparseIndex {
     }
 
     pub async fn sync(&mut self) -> Result<()> {
-        self.file.sync_data().await?;
+        self.file.sync_data()?;
         Ok(())
     }
 
-    async fn write_entry(&mut self, entry: &IndexEntry) -> Result<()> {
+    fn write_entry(&mut self, entry: &IndexEntry) -> Result<()> {
         let mut buf = [0u8; ENTRY_SIZE];
         buf[0..4].copy_from_slice(&entry.relative_offset.to_be_bytes());
         buf[4..8].copy_from_slice(&entry.file_position.to_be_bytes());
-        self.file.write_all(&buf).await?;
+        self.file.write_all(&buf)?;
         Ok(())
     }
 }

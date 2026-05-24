@@ -77,7 +77,7 @@ async fn ensure_topic(broker: &Kafko, name: &str, compression: Compression) -> R
     Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main]
 async fn main() -> Result<()> {
     let data_dir = std::env::var("KAFKO_DATA_DIR")
         .unwrap_or_else(|_| "./kafko-http_data".to_string());
