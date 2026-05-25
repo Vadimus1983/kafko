@@ -13,6 +13,10 @@ An in-process log with Kafka-like semantics for Rust. Topics, partitions, offset
 
 `kafko` exists for use cases where your data never needs to leave the process: embedded event sourcing, edge buffers, durable in-process pub/sub, deterministic integration tests without Docker or a broker, single-binary services that want a real log instead of a `VecDeque<T>` under a mutex. SQLite is to PostgreSQL what `kafko` is to Kafka.
 
+<p align="center">
+  <img src="docs/kafko-integration.svg" alt="kafko in-process pipeline — producer → topic → consumer+producer → topic → consumer chain inside a single Rust process, persisted to disk" width="900">
+</p>
+
 ## What kafko is
 
 A single Rust crate providing:
