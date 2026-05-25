@@ -28,17 +28,10 @@ A single Rust crate providing:
 - **Compression** — none / lz4 / zstd, configured per topic
 - **Compaction** — key-based dedup of the active log (v0.2)
 - **Crash recovery** — CRC verification on read, torn-tail truncate on startup
-- **Async API on `tokio`** — `Producer::send().await` resolves once the record is appended to the OS file (page cache); see [Durability](#durability) for the exact contract
+- **Async API on `tokio`** — `Producer::send().await` resolves once the record is appended to the OS file (page cache); see the [project README](https://github.com/Vadimus1983/kafko#durability) for the full durability contract
 - **Single-writer-per-partition invariant** — no global mutex on the hot path
 
 The killer use case isn't "replace Kafka." It's **testing log-shaped application code in-process**: open a `Kafko` in the same test binary, call the produce/consume/seek APIs directly, and get offset-aware integration tests without containers, brokers, or flake.
-
-## What kafko is NOT
-
-- Not a competitor to real Kafka — no distribution, no replication, no Kafka wire-protocol
-- Not a queue (queues consume = remove; logs are append-only with replay)
-- Not a substitute for RabbitMQ-style routing (different category)
-- Not for sub-microsecond hot paths (use a matching-engine WAL pattern with `io_uring` + `O_DIRECT` for that)
 
 ## Quickstart
 
@@ -87,139 +80,6 @@ broker
     .await?;
 ```
 
-## Performance recipes — pick once, ship it
-
-The default `LogConfig` is within ~4 % of optimum for single-producer workloads. The headline tunable is **which API you call** (`send` vs `send_batch`), not `LogConfig` fields. Pick a row from the decision table, copy the snippet below.
-
-All throughput numbers are 256 B records, single producer, in-process, criterion-measured. Full bench matrices + reproducible scripts at <https://github.com/Vadimus1983/kafko>.
-
-| Goal | API | Compression | LogConfig | Throughput |
-|---|---|---|---|---:|
-| **Max throughput, compressible payloads** | `send_batch(N≥128)` | `Lz4` | `default()` | **~3.3 M rec/s** |
-| **Max throughput, incompressible payloads** | `send_batch(N≥128)` | `None` | `default()` | **~2.5 M rec/s** |
-| **Best disk-efficiency** | `send_batch(N≥32)` | `Zstd` | `default()` | ~1 M rec/s |
-| **Lowest single-record latency** | `send()` | `None` | `default()` | ~250 K rec/s, **~4 µs/send** |
-| **Many concurrent producers** | `send()` × N tasks | `None` or `Lz4` | bump `batch_max_bytes` to 1 MiB | scales until disk caps |
-
-### Recipe 1 — Max throughput (compressible payloads)
-
-```rust
-use bytes::Bytes;
-use kafko::{Compression, Kafko, LogConfig};
-
-let broker = Kafko::open("./data").await?;
-broker
-    .create_topic_with_config(
-        "events",
-        LogConfig { compression: Compression::Lz4, ..Default::default() },
-    )
-    .await?;
-
-let producer = broker.producer_for("events").await?;
-let batch: Vec<(Option<Bytes>, Bytes)> = (0..1024)
-    .map(|i| (None, Bytes::from(format!("event-{i}"))))
-    .collect();
-let _offsets = producer.send_batch(batch).await?;
-```
-
-For redundant payloads (JSON, logs, protobuf with shared schemas), Lz4 is genuinely free — saved disk I/O more than pays for compression CPU.
-
-### Recipe 2 — Max throughput (incompressible payloads)
-
-Same as Recipe 1 but `Compression::None` — for already-compressed data (encrypted blobs, JPEG/MP4 frames, random IDs).
-
-### Recipe 3 — Lowest single-record latency
-
-```rust
-let _offset = producer.send(None, Bytes::from("one event")).await?;
-```
-
-Floor ~4 µs per send. **Don't add compression here** — at this latency scale the codec CPU outweighs the disk savings.
-
-### Recipe 4 — Many concurrent producers (no batch API)
-
-kafko's writer task already coalesces concurrent sends into batched disk writes (the "natural batching" path). Bump the natural-batch ceiling so more sends fit per disk write:
-
-```rust
-broker
-    .create_topic_with_config(
-        "events",
-        LogConfig {
-            batch_max_bytes: 1024 * 1024,   // default is 64 KiB
-            batch_max_records: 8192,
-            ..Default::default()
-        },
-    )
-    .await?;
-```
-
-Spawn N tasks each calling `producer.clone().send(...)` in a loop. Throughput scales with concurrency until disk bandwidth caps.
-
-### What NOT to tune
-
-- **`segment_size_threshold`** — anywhere between 1 MiB and 256 MiB performs within noise. Default (1 GiB) is fine for almost any workload.
-- **`index_interval`** — 4 KiB (default) is the sweet spot. Smaller hurts because of constant index writes; larger doesn't help.
-- **Sub-MiB segments** — measurably 32 % slower than default due to rotation pressure. Only worth it if disk-constrained AND read-heavy on cold data.
-
-## Durability
-
-kafko v0.1 provides the **same durability contract as Kafka with `acks=1`** — leader has the record in page cache, not necessarily on disk:
-
-- `Producer::send().await` resolves once the record has been written to the OS file via `write_all`. The bytes are in the **OS page cache**, owned by the kernel — they survive process crashes (panic, SIGKILL, OOM) because the process doesn't own them.
-- `Producer::send().await` does **not** fsync. Records may be lost if the OS crashes, the kernel panics, or the host loses power before automatic writeback (typically seconds on Linux / Windows).
-- Torn or partial writes at the tail of the active segment are detected and truncated on next startup via CRC scan; the sparse index is rebuilt from the verified segment.
-- For stricter guarantees, the partition exposes an explicit `sync()` you can call after `send`. A configurable per-call fsync policy (`EveryRecord` / `EveryBatch` / `EveryNms` / `Never`) is on the v0.2 roadmap.
-
-### Graceful shutdown
-
-`Kafko::shutdown().await` is a real durability boundary: every partition's writer task drains its inbox, fsyncs the active segment, and exits before the call returns. Any record that was acked to a producer before `shutdown` was called is on disk by the time `shutdown` resolves.
-
-Host applications that care about durability across `SIGTERM` / `SIGINT` / `docker stop` should install a signal handler that drives `shutdown().await` to completion before exiting:
-
-```rust,no_run
-# async fn run(broker: kafko::Kafko) -> kafko::Result<()> {
-tokio::signal::ctrl_c().await.ok();
-broker.shutdown().await?;
-# Ok(())
-# }
-```
-
-`SIGKILL`, OS panic, and power loss bypass userspace and cannot be intercepted; the recovery path on the next `Kafko::open` handles torn tails via CRC scan, but any record whose page-cache bytes had not yet been written back by the kernel may be lost.
-
-**Drop-without-shutdown fallback.** If you let the broker go out of scope without calling `shutdown()`, kafko's `Drop` impl runs the same graceful shutdown as a best-effort fallback:
-
-- On a **multi-thread tokio runtime** (the default `#[tokio::main]`), Drop uses `block_in_place` + `block_on` to drive every writer task to completion before returning. Durability is identical to explicit `shutdown()`; you just lose the ability to observe any error it might have returned.
-- On a **current-thread runtime**, Drop can't safely block — it spawns the cleanup detached and may not complete before runtime teardown. Call `shutdown().await` explicitly in this case.
-- With **no reachable tokio runtime**, Drop releases the directory lock and lets the writer tasks be aborted by whatever owns the runtime they were spawned on.
-
-If you need `acks=all`-style multi-replica durability, kafko is not the right tool — use Kafka.
-
-## Architecture
-
-One broker object, many cheap handles. Each partition has its own writer task that exclusively owns the active segment file. **No global mutex on the hot path.**
-
-```
-                +-------------------------------------+
-                |  Kafko (Arc<KafkoInner>)            |
-                |  - Topic registry (RwLock)          |
-                |  - HashMap<(topic,part), Handle>    |
-                +--------+----------------------------+
-                         | Arc::clone (cheap)
-        +----------------+----------------+
-        |                |                |
-   Producer         Producer         Consumer
-        |                |                |
-        |   send via per-partition inbox  |
-        +----------------v----------------+
-              +----------+----------+
-              v                     v
-       Partition writer task    Partition writer task
-       (single mpsc owner)      (single mpsc owner)
-              |                     |
-              v                     v
-       orders-0/ segments      payments-0/ segments
-```
-
 ## v0.1 — what's in
 
 - Single partition per topic
@@ -231,7 +91,7 @@ One broker object, many cheap handles. Each partition has its own writer task th
 - Per-topic compression (none / lz4 / zstd)
 - Data-directory lockfile — concurrent `Kafko::open` on the same dir fails fast with `KafkoError::AlreadyOpen`
 - Writer-task panic recovery — typed `KafkoError::PartitionPanicked` instead of generic `Closed`
-- Graceful shutdown via explicit `shutdown().await` or `Drop` fallback (see [Durability](#durability))
+- Graceful shutdown via explicit `shutdown().await` or `Drop` fallback
 - `Producer::send_batch` for atomic, single-round-trip batched appends (v0.1.1)
 
 ## v0.2 — roadmap
@@ -243,19 +103,9 @@ One broker object, many cheap handles. Each partition has its own writer task th
 - Headers / record metadata
 - Per-topic config persistence
 
-## Not on the roadmap
+## Benchmarks, recipes, full docs
 
-- Kafka wire-protocol compatibility (different category of tool)
-- Distributed replication (kafko is in-process by design — if you need replication, use Kafka)
-- Schema registry, Connect, Streams ecosystem (out of scope)
-
-## Benchmarks
-
-Two complementary measurement shapes — HTTP-path numbers (kafko exposed via the workspace's `kafko-http` test harness, driven by `oha` in Docker) and library-only in-process numbers (`Producer::send().await` from `crates/kafko-bench`). Both, with reproducible scripts and saved baselines, live in the repository at <https://github.com/Vadimus1983/kafko>.
-
-## Codec note — LZ4 per-call allocation
-
-LZ4 (`Compression::Lz4`) currently allocates a fresh 8 KiB hash table on every record encode (16 KiB on records larger than 64 KiB). This is a property of `lz4_flex` 0.11: its public block-compress API does not expose a way to reuse the internal hash table across calls. Throughput is unaffected, but for memory-constrained or allocator-sensitive deployments **`Compression::Zstd` is the allocation-free codec on the write path** (its thread-local `zstd::bulk::Compressor` reuses internal state). See the repository README for details.
+The [project README on GitHub](https://github.com/Vadimus1983/kafko) carries the full bench matrices, performance-tuning recipes, durability contract, architecture diagram, codec notes, and the v0.2 architectural details. The [CHANGELOG](https://github.com/Vadimus1983/kafko/blob/main/CHANGELOG.md) tracks per-version changes.
 
 ## License
 
