@@ -5,6 +5,7 @@ members = [
     "crates/kafko-http",
     "crates/kafko-bench",
 ]
+exclude = ["fuzz"]
 
 [profile.bench]
 lto = "fat"

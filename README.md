@@ -210,6 +210,32 @@ Small-record cells are nearly 10× the HTTP-path numbers — that's the cost of 
 
 Function-level timing + allocation snapshots and full methodology in `crates/kafko-bench/baselines/`.
 
+### Library hot path — `send_batch` vs single `send` (v0.1.1, 256 B records)
+
+Same in-process path as above, but driven by `cargo bench -p kafko --bench send_batch` so a single producer either calls `send_batch(N)` once or loops N single `send()` calls. The gap is the mpsc round-trip cost saved per record.
+
+| Records per call (N) | `send_batch(N)` | Loop of N × `send()` | **Speedup** |
+|---:|---:|---:|---:|
+| 1 | 273 K rec/s | 272 K rec/s | 1.0× |
+| 8 | 635 K rec/s | 261 K rec/s | **2.4×** |
+| 32 | 1.34 M rec/s | 241 K rec/s | **5.6×** |
+| 128 | 2.26 M rec/s | 245 K rec/s | **9.2×** |
+| 1024 | **2.53 M rec/s** | 252 K rec/s | **10.0×** |
+
+The single-`send` floor of ~250 K rec/s is the mpsc actor round-trip (~4 µs per record); batching saves `(N − 1)` of those round-trips and lowers to one `Log::append_batch` call. The curve flattens by N = 128 and is fully amortized by N = 1024.
+
+#### `send_batch` with compression (256 B all-zero values)
+
+| Compression | N = 1 | N = 128 | N = 1024 |
+|---|---:|---:|---:|
+| None | 273 K | 2.26 M | 2.53 M |
+| **Lz4** | 254 K | 2.46 M | **3.34 M** |
+| Zstd | 240 K | 1.02 M | 1.13 M |
+
+**Lz4 is faster than None at large batches** because the all-zero payload compresses ~96 %, so the writer task spends proportionally less time on disk I/O. With genuinely random / incompressible data, expect Lz4 to track None within ±10 %.
+
+Reproduce: `cargo bench -p kafko --bench send_batch -- --baseline v0_1_1` (compares against the pinned v0.1.1 baseline under `target/criterion/`).
+
 ### Codec note — LZ4 per-call allocation
 
 LZ4 (`Compression::Lz4`) allocates a fresh **8 KiB hash table on every record encode** (16 KiB on records larger than 64 KiB). This is a property of [`lz4_flex` 0.11](https://crates.io/crates/lz4_flex), kafko's LZ4 dependency: the public block-compress API does not expose a way to reuse the internal hash table across calls. In the in-process bench above, **~1.2 GB of the 1.3 GB total heap traffic** comes from this single source.
@@ -217,6 +243,103 @@ LZ4 (`Compression::Lz4`) allocates a fresh **8 KiB hash table on every record en
 The allocations are short-lived (freed immediately after each call) and don't visibly hurt throughput — LZ4 is still the rec/s leader at small records. But for memory-constrained or allocator-sensitive deployments, **zstd is the allocation-free codec on the write path**: `zstd::bulk::Compressor` is held in a thread-local and reuses its internal state across calls, so zstd's per-record heap footprint is essentially zero.
 
 This is fixable only at the dependency level — either when `lz4_flex` exposes a stateful block-compressor API, or by vendoring a slim equivalent into kafko.
+
+## Performance recipes — pick once, ship it
+
+Default config is **already near-optimum for single-producer workloads** — the `preset_configs/throughput_oriented` bench buys only ~4 % over `LogConfig::default()`. So the recipes below mostly differ in **which API you call** (`send` vs `send_batch`) and **which codec you pick**, not in `LogConfig` tuning.
+
+All throughput numbers are 256 B records, single producer, in-process. Larger records hit MiB/s ceilings sooner — see the size matrices above.
+
+| Goal | API | Compression | `LogConfig` | Expected throughput | Per-record latency |
+|---|---|---|---|---|---|
+| **Max throughput, compressible payloads** | `send_batch(N≥128)` | `Lz4` | `default()` | **~3.3 M rec/s** | amortized over batch |
+| **Max throughput, incompressible payloads** | `send_batch(N≥128)` | `None` | `default()` | **~2.5 M rec/s** | amortized over batch |
+| **Disk-efficient (best compression ratio)** | `send_batch(N≥32)` | `Zstd` | `default()` | ~1 M rec/s | amortized over batch |
+| **Lowest single-record latency** | `send()` | `None` | `default()` | ~250 K rec/s | **~4 µs / send** |
+| **Many concurrent producers, no batch API** | `send()` × N tasks | `None` or `Lz4` | bump `batch_max_bytes` to 1 MiB | scales with concurrency until disk caps | ~4 µs / send |
+
+### Recipe 1 — Max throughput (compressible data)
+
+```rust
+use bytes::Bytes;
+use kafko::{Compression, Kafko, LogConfig};
+
+let broker = Kafko::open("./data").await?;
+broker
+    .create_topic_with_config(
+        "events",
+        LogConfig { compression: Compression::Lz4, ..Default::default() },
+    )
+    .await?;
+
+let producer = broker.producer_for("events").await?;
+
+// Stage 128+ records per call. The mpsc-round-trip cost amortizes ~10× vs a loop of send().
+let batch: Vec<(Option<Bytes>, Bytes)> = (0..1024)
+    .map(|i| (None, Bytes::from(format!("event-{i}"))))
+    .collect();
+let offsets = producer.send_batch(batch).await?;
+```
+
+Expect **~3.3 M rec/s** for redundant / structured payloads (e.g., JSON, logs, protobuf with shared schemas). Lz4 is genuinely free here — the disk-I/O saved more than pays for the compression CPU.
+
+### Recipe 2 — Max throughput (incompressible data)
+
+Same shape, but pick `Compression::None` (or `Lz4` — it tracks None within ±10 % when data won't compress, but with the per-call LZ4 hash-table allocation overhead, `None` is preferable):
+
+```rust
+broker
+    .create_topic_with_config(
+        "events",
+        LogConfig { compression: Compression::None, ..Default::default() },
+    )
+    .await?;
+// ...same send_batch(N≥128) loop as Recipe 1
+```
+
+Expect **~2.5 M rec/s** for already-compressed payloads (encrypted blobs, JPEG/MP4 frames, random IDs).
+
+### Recipe 3 — Lowest single-record latency
+
+When you can't batch — interactive request handling, event-by-event ingestion from an upstream stream — use `send()` directly:
+
+```rust
+let producer = broker.producer_for("events").await?;
+let offset = producer.send(None, Bytes::from("one event")).await?;
+```
+
+Floor: ~**4 µs per send** (mpsc → writer-task → fsync-to-page-cache → reply), ~250 K rec/s per producer. **Compression doesn't help here** — at this latency scale the codec cost dominates over disk savings.
+
+### Recipe 4 — Many concurrent producers
+
+When you have N producer tasks all hitting the same topic, kafko's writer task already **coalesces concurrent appends into batched disk writes** (the "natural batching" path). You don't need to write `send_batch` glue — just call `send()` in each task and bump the natural-batch ceiling:
+
+```rust
+broker
+    .create_topic_with_config(
+        "events",
+        LogConfig {
+            // Default is 64 KiB; raise to 1 MiB so more sends coalesce into each disk write.
+            batch_max_bytes: 1024 * 1024,
+            batch_max_records: 8192,
+            ..Default::default()
+        },
+    )
+    .await?;
+
+let producer = broker.producer_for("events").await?;
+// Spawn N tasks each calling producer.clone().send(...) in a loop.
+```
+
+Throughput scales with concurrency until disk bandwidth caps. The hotpath profiler shows ~6 sends coalesced per disk write under default `batch_max_bytes`; raising it lets that grow.
+
+### What NOT to tune
+
+The `config_sweep` bench data settled these — don't waste time on:
+
+- **`segment_size_threshold`** — anywhere between 1 MiB and 256 MiB performs within noise. The default 1 GiB is fine for almost any workload; only drop it if you genuinely need smaller files on disk.
+- **`index_interval`** — the default 4 KiB is the sweet spot. Smaller (≤ 1 KiB) measurably hurts because of constant index writes; larger (≥ 32 KiB) doesn't help.
+- **`segment_size_threshold` below 1 MiB** — the `small_footprint` preset in `config_sweep` is **32 % slower** than default because rotation pressure dominates. Only worth it if you're disk-constrained AND read-heavy on cold data.
 
 ## v0.1 — what's in
 
@@ -227,11 +350,11 @@ This is fixable only at the dependency level — either when `lz4_flex` exposes 
 - Time- and size-based retention
 - Producer + Consumer async API on `tokio`
 - Per-topic compression (none / lz4 / zstd)
+- `Producer::send_batch` for atomic, single-round-trip batched appends (v0.1.1)
 - `kafko-http` — a separate workspace crate (`crates/kafko-http/`) exposing the broker over HTTP for integration testing and benchmarking
 
 ## v0.2 — roadmap
 
-- `Producer::send_batch` + framed `POST /produce_batch` for opportunistic batching (no `linger.ms` window)
 - Multi-partition with key-based routing
 - Consumer groups with independent committed offsets
 - Log compaction (key-based dedup)
@@ -274,6 +397,30 @@ cargo run --release -p kafko-bench
 ```
 
 See [`scripts/README.md`](scripts/README.md) for the full bench-script catalogue.
+
+## Fuzzing
+
+The `fuzz/` directory holds cargo-fuzz targets for the wire-format trust boundary. It is deliberately outside the main workspace because libFuzzer requires a nightly toolchain and the cargo-fuzz CLI, which are overkill for the regular build and test cycle.
+
+```bash
+# One-time setup
+cargo install cargo-fuzz
+rustup toolchain install nightly
+
+# Run a target (continues until Ctrl-C; corpus + crash artifacts persist under fuzz/)
+cargo +nightly fuzz run decode_record
+
+# Reproduce a saved crash artifact
+cargo +nightly fuzz run decode_record fuzz/artifacts/decode_record/<artifact-id>
+```
+
+Existing targets:
+
+- `decode_record` — feeds arbitrary bytes to `Record::decode`. Catches the truncation, CRC-mismatch, and invalid-length paths; rarely reaches deeper code because random bytes almost never pass the CRC.
+- `decode_record_structured` — hand-builds a wire-format record with chosen flag/key/value bytes and a **valid CRC**, so the decoder reaches the flag-parse and decompress paths that the unstructured target almost never exercises. The decompressor wrappers (lz4_flex, zstd) must not panic on adversarial payloads.
+- `recovery_torn_tail` — feeds arbitrary bytes as the active segment file (`00…0.log`) and runs `Log::open`. Recovery must find the longest valid prefix, truncate the rest, and produce a Log where every offset in `[0, next_offset)` reads back successfully.
+- `sparse_index_parse` — feeds arbitrary bytes as the `00…0.index` file and exercises both `SparseIndex::open` and `lookup(u64)` against the parsed result. Neither must panic regardless of how malformed the entry table is.
+- `log_op_sequence` — model-based fuzzer that generates an `Arbitrary` sequence of `(append, sync, read, retention)` operations against a fresh `Log` with `Arbitrary` `LogConfig` (small thresholds force rotation pressure). Checks state-machine invariants: offsets are monotonic, no panic on any input, no committed-record corruption.
 
 ## License
 

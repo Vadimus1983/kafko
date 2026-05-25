@@ -1,6 +1,6 @@
 [package]
 name = "kafko"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "In-process log with Kafka-like semantics: topics, partitions, offset-based reads, replay, retention."
 license = "MIT OR Apache-2.0"
@@ -45,4 +45,12 @@ harness = false
 
 [[bench]]
 name = "partition"
+harness = false
+
+[[bench]]
+name = "send_batch"
+harness = false
+
+[[bench]]
+name = "config_sweep"
 harness = false

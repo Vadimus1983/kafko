@@ -70,6 +70,65 @@ impl Producer {
     pub async fn send_record(&self, record: Record) -> Result<u64> {
         self.partition.append(record).await
     }
+
+    /// Appends a batch of records as a single atomic unit, timestamping every
+    /// record at the moment of the call, and returns the assigned offsets in
+    /// input order. The batch becomes visible at the partition's high-water-mark
+    /// together — consumers never observe a partial batch.
+    ///
+    /// An empty input is a no-op that returns `Ok(Vec::new())` without
+    /// contacting the writer task. Saves `(N - 1)` actor round-trips compared
+    /// to looping over [`send`]; on the storage side it lowers to the same
+    /// single `Log::append_batch` call the partition uses to coalesce
+    /// naturally-batched sends.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use bytes::Bytes;
+    /// use kafko::Kafko;
+    ///
+    /// # async fn run() -> kafko::Result<()> {
+    /// let broker = Kafko::open("./data").await?;
+    /// broker.create_topic("orders").await?;
+    /// let producer = broker.producer_for("orders").await?;
+    ///
+    /// let offsets = producer
+    ///     .send_batch(vec![
+    ///         (None, Bytes::from("order-1")),
+    ///         (Some(Bytes::from("k2")), Bytes::from("order-2")),
+    ///         (None, Bytes::from("order-3")),
+    ///     ])
+    ///     .await?;
+    /// assert_eq!(offsets, vec![0, 1, 2]);
+    /// # broker.shutdown().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`send`]: Producer::send
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub async fn send_batch(&self, items: Vec<(Option<Bytes>, Bytes)>) -> Result<Vec<u64>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let timestamp_ms = current_timestamp_ms();
+        let records: Vec<Record> = items
+            .into_iter()
+            .map(|(key, value)| Record::new(timestamp_ms, key, value))
+            .collect();
+        self.partition.append_batch(records).await
+    }
+
+    /// Like [`send_batch`], but takes already-constructed records so callers
+    /// can preserve per-record timestamps from upstream. The atomicity and
+    /// ordering semantics are identical.
+    ///
+    /// [`send_batch`]: Producer::send_batch
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub async fn send_batch_records(&self, records: Vec<Record>) -> Result<Vec<u64>> {
+        self.partition.append_batch(records).await
+    }
 }
 
 fn current_timestamp_ms() -> i64 {

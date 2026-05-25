@@ -2,9 +2,18 @@ use crate::error::{KafkoError, Result};
 use std::cell::RefCell;
 
 const ZSTD_LEVEL: i32 = 3;
-// Upper bound on a single record's decompressed size. Records larger than this will
-// fail decompression. 16 MiB is comfortably above any realistic per-record payload.
-const ZSTD_DECOMPRESS_MAX_SIZE: usize = 16 * 1024 * 1024;
+// Upper bound on a single record's decompressed size, applied uniformly to both
+// LZ4 and Zstd. 16 MiB is comfortably above any realistic per-record payload.
+//
+// This bound is load-bearing for safety, not just convenience: lz4_flex's
+// `decompress_size_prepended` reads the 4-byte LE size prefix and calls
+// `Vec::with_capacity(claimed)` *before* validating the compressed bytes. An
+// attacker (or an unfortunate torn-tail recovery producing a CRC-valid garbage
+// record) can claim ~4 GiB in a tiny payload and OOM the process. We cap the
+// claimed size here before delegating. Zstd's bulk Decompressor::decompress
+// already takes a max-output-size argument; LZ4 does not, so we enforce it
+// ourselves. Discovered by the `decode_record_structured` fuzz target.
+const DECOMPRESS_MAX_SIZE: usize = 16 * 1024 * 1024;
 
 thread_local! {
     static ZSTD_COMPRESSOR: RefCell<Option<zstd::bulk::Compressor<'static>>> =
@@ -100,8 +109,22 @@ impl Compression {
     pub(crate) fn decompress(self, compressed: &[u8]) -> Result<Vec<u8>> {
         match self {
             Compression::None => Ok(compressed.to_vec()),
-            Compression::Lz4 => lz4_flex::decompress_size_prepended(compressed)
-                .map_err(|_| KafkoError::DecompressionFailed),
+            Compression::Lz4 => {
+                if compressed.len() < 4 {
+                    return Err(KafkoError::DecompressionFailed);
+                }
+                let claimed_size = u32::from_le_bytes([
+                    compressed[0],
+                    compressed[1],
+                    compressed[2],
+                    compressed[3],
+                ]) as usize;
+                if claimed_size > DECOMPRESS_MAX_SIZE {
+                    return Err(KafkoError::DecompressionFailed);
+                }
+                lz4_flex::decompress_size_prepended(compressed)
+                    .map_err(|_| KafkoError::DecompressionFailed)
+            }
             Compression::Zstd => ZSTD_DECOMPRESSOR.with(|d| {
                 let mut d = d.borrow_mut();
                 if d.is_none() {
@@ -112,9 +135,67 @@ impl Compression {
                 }
                 d.as_mut()
                     .expect("decompressor initialized by the is_none branch above")
-                    .decompress(compressed, ZSTD_DECOMPRESS_MAX_SIZE)
+                    .decompress(compressed, DECOMPRESS_MAX_SIZE)
                     .map_err(|_| KafkoError::DecompressionFailed)
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lz4_decompress_rejects_oversized_size_prefix() {
+        // Crafted payload that claims ~4 GiB decompressed size in its 4-byte LE
+        // prefix. Without the guard, lz4_flex would Vec::with_capacity that much
+        // and OOM. With the guard we return DecompressionFailed before the
+        // allocation. Found by the `decode_record_structured` fuzz target on
+        // input `oom-25f853ff8087d2ab14b530825448b7be1d5f045d`.
+        let payload = [0x55u8, 0xFF, 0xFF, 0xFF, 0x00];
+        match Compression::Lz4.decompress(&payload) {
+            Err(KafkoError::DecompressionFailed) => {}
+            other => panic!("expected DecompressionFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lz4_decompress_rejects_payload_shorter_than_size_prefix() {
+        for len in 0..4 {
+            let buf = vec![0u8; len];
+            match Compression::Lz4.decompress(&buf) {
+                Err(KafkoError::DecompressionFailed) => {}
+                other => panic!("len={len}: expected DecompressionFailed, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn lz4_decompress_accepts_normally_sized_payload() {
+        // Round-trip a moderate payload to confirm the guard doesn't reject
+        // legitimate inputs whose claimed size sits below the cap.
+        let raw = vec![0xABu8; 4096];
+        let mut compressed = Vec::new();
+        Compression::Lz4.compress(&raw, &mut compressed);
+        let decompressed = Compression::Lz4.decompress(&compressed).unwrap();
+        assert_eq!(decompressed, raw);
+    }
+
+    #[test]
+    fn zstd_decompress_rejects_oversized_claim() {
+        // Zstd's wire format carries the uncompressed size internally; the bulk
+        // Decompressor::decompress call already takes a max-output-size argument
+        // (DECOMPRESS_MAX_SIZE). A frame claiming a larger output must fail with
+        // DecompressionFailed rather than allocating beyond the cap.
+        let raw = vec![0u8; DECOMPRESS_MAX_SIZE + 1];
+        // Compress with a fresh Compressor (not the thread-local; we want a
+        // legitimately-encoded frame that claims more bytes than our cap).
+        let mut c = zstd::bulk::Compressor::new(ZSTD_LEVEL).unwrap();
+        let frame = c.compress(&raw).unwrap();
+        match Compression::Zstd.decompress(&frame) {
+            Err(KafkoError::DecompressionFailed) => {}
+            other => panic!("expected DecompressionFailed, got {:?}", other),
         }
     }
 }

@@ -32,6 +32,10 @@ enum PartitionCommand {
         record: Record,
         reply: oneshot::Sender<Result<u64>>,
     },
+    AppendBatch {
+        records: Vec<Record>,
+        reply: oneshot::Sender<Result<Vec<u64>>>,
+    },
     ReadAt {
         offset: u64,
         reply: oneshot::Sender<Result<Option<Record>>>,
@@ -99,6 +103,39 @@ impl Partition {
             .inbox
             .send(PartitionCommand::Append {
                 record,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err(self.writer_death_error().await);
+        }
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(self.writer_death_error().await),
+        }
+    }
+
+    /// Appends a batch of records as a single atomic unit and returns the
+    /// assigned offsets in input order. The batch becomes visible at the
+    /// partition's high-water-mark together — consumers never observe a
+    /// partial batch. Producers usually call this via [`Producer::send_batch`]
+    /// rather than directly.
+    ///
+    /// An empty input is a no-op that returns `Ok(Vec::new())` without
+    /// contacting the writer task.
+    ///
+    /// [`Producer::send_batch`]: crate::Producer::send_batch
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub async fn append_batch(&self, records: Vec<Record>) -> Result<Vec<u64>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .inbox
+            .send(PartitionCommand::AppendBatch {
+                records,
                 reply: reply_tx,
             })
             .await
@@ -377,6 +414,27 @@ async fn flush_append_batch(
     }
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+async fn flush_explicit_batch(
+    log: &mut Log,
+    hwm_tx: &watch::Sender<u64>,
+    records: Vec<Record>,
+    reply: oneshot::Sender<Result<Vec<u64>>>,
+    fail_next_kind: &mut Option<std::io::ErrorKind>,
+) {
+    if let Some(kind) = fail_next_kind.take() {
+        let _ = reply.send(Err(KafkoError::Io(std::io::Error::from(kind))));
+        return;
+    }
+    let result = log.append_batch(records).await;
+    if let Ok(offsets) = &result
+        && let Some(&last) = offsets.last()
+    {
+        let _ = hwm_tx.send(last + 1);
+    }
+    let _ = reply.send(result);
+}
+
 async fn handle_single_command(
     log: &mut Log,
     hwm_tx: &watch::Sender<u64>,
@@ -394,6 +452,9 @@ async fn handle_single_command(
                 let _ = hwm_tx.send(*offset + 1);
             }
             let _ = reply.send(result);
+        }
+        PartitionCommand::AppendBatch { records, reply } => {
+            flush_explicit_batch(log, hwm_tx, records, reply, fail_next_kind).await;
         }
         PartitionCommand::ReadAt { offset, reply } => {
             let result = log.read_record_at(offset).await;

@@ -83,6 +83,80 @@ broker
     .await?;
 ```
 
+## Performance recipes — pick once, ship it
+
+The default `LogConfig` is within ~4 % of optimum for single-producer workloads. The headline tunable is **which API you call** (`send` vs `send_batch`), not `LogConfig` fields. Pick a row from the decision table, copy the snippet below.
+
+All throughput numbers are 256 B records, single producer, in-process, criterion-measured. Full bench matrices + reproducible scripts at <https://github.com/Vadimus1983/kafko>.
+
+| Goal | API | Compression | LogConfig | Throughput |
+|---|---|---|---|---:|
+| **Max throughput, compressible payloads** | `send_batch(N≥128)` | `Lz4` | `default()` | **~3.3 M rec/s** |
+| **Max throughput, incompressible payloads** | `send_batch(N≥128)` | `None` | `default()` | **~2.5 M rec/s** |
+| **Best disk-efficiency** | `send_batch(N≥32)` | `Zstd` | `default()` | ~1 M rec/s |
+| **Lowest single-record latency** | `send()` | `None` | `default()` | ~250 K rec/s, **~4 µs/send** |
+| **Many concurrent producers** | `send()` × N tasks | `None` or `Lz4` | bump `batch_max_bytes` to 1 MiB | scales until disk caps |
+
+### Recipe 1 — Max throughput (compressible payloads)
+
+```rust
+use bytes::Bytes;
+use kafko::{Compression, Kafko, LogConfig};
+
+let broker = Kafko::open("./data").await?;
+broker
+    .create_topic_with_config(
+        "events",
+        LogConfig { compression: Compression::Lz4, ..Default::default() },
+    )
+    .await?;
+
+let producer = broker.producer_for("events").await?;
+let batch: Vec<(Option<Bytes>, Bytes)> = (0..1024)
+    .map(|i| (None, Bytes::from(format!("event-{i}"))))
+    .collect();
+let _offsets = producer.send_batch(batch).await?;
+```
+
+For redundant payloads (JSON, logs, protobuf with shared schemas), Lz4 is genuinely free — saved disk I/O more than pays for compression CPU.
+
+### Recipe 2 — Max throughput (incompressible payloads)
+
+Same as Recipe 1 but `Compression::None` — for already-compressed data (encrypted blobs, JPEG/MP4 frames, random IDs).
+
+### Recipe 3 — Lowest single-record latency
+
+```rust
+let _offset = producer.send(None, Bytes::from("one event")).await?;
+```
+
+Floor ~4 µs per send. **Don't add compression here** — at this latency scale the codec CPU outweighs the disk savings.
+
+### Recipe 4 — Many concurrent producers (no batch API)
+
+kafko's writer task already coalesces concurrent sends into batched disk writes (the "natural batching" path). Bump the natural-batch ceiling so more sends fit per disk write:
+
+```rust
+broker
+    .create_topic_with_config(
+        "events",
+        LogConfig {
+            batch_max_bytes: 1024 * 1024,   // default is 64 KiB
+            batch_max_records: 8192,
+            ..Default::default()
+        },
+    )
+    .await?;
+```
+
+Spawn N tasks each calling `producer.clone().send(...)` in a loop. Throughput scales with concurrency until disk bandwidth caps.
+
+### What NOT to tune
+
+- **`segment_size_threshold`** — anywhere between 1 MiB and 256 MiB performs within noise. Default (1 GiB) is fine for almost any workload.
+- **`index_interval`** — 4 KiB (default) is the sweet spot. Smaller hurts because of constant index writes; larger doesn't help.
+- **Sub-MiB segments** — measurably 32 % slower than default due to rotation pressure. Only worth it if disk-constrained AND read-heavy on cold data.
+
 ## Durability
 
 kafko v0.1 provides the **same durability contract as Kafka with `acks=1`** — leader has the record in page cache, not necessarily on disk:
@@ -154,10 +228,10 @@ One broker object, many cheap handles. Each partition has its own writer task th
 - Data-directory lockfile — concurrent `Kafko::open` on the same dir fails fast with `KafkoError::AlreadyOpen`
 - Writer-task panic recovery — typed `KafkoError::PartitionPanicked` instead of generic `Closed`
 - Graceful shutdown via explicit `shutdown().await` or `Drop` fallback (see [Durability](#durability))
+- `Producer::send_batch` for atomic, single-round-trip batched appends (v0.1.1)
 
 ## v0.2 — roadmap
 
-- `Producer::send_batch` for opportunistic batching (no `linger.ms` window)
 - Multi-partition with key-based routing
 - Consumer groups with independent committed offsets
 - Log compaction (key-based dedup)

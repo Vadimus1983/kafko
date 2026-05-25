@@ -19,10 +19,19 @@
 //!     let broker = Kafko::open("./data").await?;
 //!     broker.create_topic("orders").await?;
 //!
-//!     // Produce
+//!     // Produce one record
 //!     let producer = broker.producer_for("orders").await?;
 //!     let offset = producer.send(None, Bytes::from("order-1")).await?;
 //!     println!("appended at offset {offset}");
+//!
+//!     // Produce many records atomically in one round-trip
+//!     let offsets = producer
+//!         .send_batch(vec![
+//!             (None, Bytes::from("order-2")),
+//!             (None, Bytes::from("order-3")),
+//!         ])
+//!         .await?;
+//!     println!("batch offsets: {:?}", offsets);
 //!
 //!     // Consume from the beginning
 //!     let mut consumer = broker.consumer_for("orders").await?;

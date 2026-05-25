@@ -82,8 +82,17 @@ impl Segment {
     /// Returns true if appending `additional` bytes would push this segment
     /// past `threshold`. Used by [`Log`] to decide when to rotate.
     ///
+    /// An empty segment always accepts the first write, even if `additional`
+    /// already exceeds `threshold` — otherwise rotation would try to create a
+    /// new segment at the same base offset and fail. The size cap is a soft
+    /// target: a single oversized append produces one oversized segment, and
+    /// rotation kicks in on the next append.
+    ///
     /// [`Log`]: crate::Log
     pub fn would_overflow(&self, additional: usize, threshold: u64) -> bool {
+        if self.size == 0 {
+            return false;
+        }
         self.size + additional as u64 > threshold
     }
 

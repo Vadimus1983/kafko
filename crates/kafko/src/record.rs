@@ -387,4 +387,36 @@ mod tests {
         let decoded = Record::decode(&mut slice).unwrap();
         assert_eq!(decoded.value(), &payload);
     }
+
+    #[test]
+    fn decode_rejects_lz4_record_with_oversized_decompressed_size_claim() {
+        // End-to-end fuzz regression: a CRC-valid record whose LZ4 value bytes
+        // claim a ~4 GiB decompressed size must fail with DecompressionFailed,
+        // not OOM the process. Originally found by `decode_record_structured`
+        // fuzz target on input `oom-25f853ff8087d2ab14b530825448b7be1d5f045d`.
+        const KEY_NULL_SENTINEL_LOCAL: u32 = u32::MAX;
+        let hostile_lz4_payload: [u8; 5] = [0x55, 0xFF, 0xFF, 0xFF, 0x00];
+
+        let payload_field_len = 1 + 8 + 4 + (4 + hostile_lz4_payload.len());
+        let total_len = 4 + payload_field_len;
+
+        let mut wire = Vec::with_capacity(4 + total_len);
+        wire.extend_from_slice(&(total_len as u32).to_be_bytes());
+        let crc_pos = wire.len();
+        wire.extend_from_slice(&[0u8; 4]);
+        let payload_start = wire.len();
+        wire.push(Compression::Lz4.flag());
+        wire.extend_from_slice(&0i64.to_be_bytes());
+        wire.extend_from_slice(&KEY_NULL_SENTINEL_LOCAL.to_be_bytes());
+        wire.extend_from_slice(&(hostile_lz4_payload.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&hostile_lz4_payload);
+        let crc = crc32fast::hash(&wire[payload_start..]);
+        wire[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_be_bytes());
+
+        let mut slice: &[u8] = &wire;
+        match Record::decode(&mut slice) {
+            Err(KafkoError::DecompressionFailed) => {}
+            other => panic!("expected DecompressionFailed, got {:?}", other),
+        }
+    }
 }

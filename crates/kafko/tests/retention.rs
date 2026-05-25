@@ -128,12 +128,12 @@ async fn apply_retention_deletes_index_files_alongside_log_files() {
     let log_files: usize = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "log"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
         .count();
     let index_files: usize = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "index"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "index"))
         .count();
 
     assert_eq!(log_files, 1);
@@ -164,7 +164,7 @@ async fn partition_runs_retention_periodically() {
     let log_files: usize = std::fs::read_dir(dir.path())
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "log"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
         .count();
 
     assert_eq!(

@@ -32,7 +32,7 @@ async fn multiple_appends_track_file_positions() {
     assert_eq!(p3, 8);
     assert_eq!(seg.size(), 12);
 
-    let mut buf = vec![0u8; 4];
+    let mut buf = [0u8; 4];
     seg.read_at(p1, &mut buf[..]).await.unwrap();
     assert_eq!(&buf[..], b"aaaa");
     seg.read_at(p2, &mut buf[..]).await.unwrap();
@@ -69,7 +69,7 @@ async fn reopen_and_append_extends_existing_data() {
     assert_eq!(pos, 5);
     assert_eq!(seg.size(), 11);
 
-    let mut buf = vec![0u8; 11];
+    let mut buf = [0u8; 11];
     seg.read_at(0, &mut buf[..]).await.unwrap();
     assert_eq!(&buf[..], b"firstsecond");
 }
@@ -127,7 +127,7 @@ async fn read_past_eof_returns_zero() {
     let mut seg = Segment::create(dir.path(), 0).await.unwrap();
     seg.append(b"hi").await.unwrap();
 
-    let mut buf = vec![0u8; 10];
+    let mut buf = [0u8; 10];
     let n = seg.read_at(100, &mut buf[..]).await.unwrap();
     assert_eq!(n, 0);
 }

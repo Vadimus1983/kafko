@@ -5,3 +5,5 @@
 
 # Bench script outputs
 scripts/tmp/
+/fuzz/Cargo.lock
+/kafko-bench_data

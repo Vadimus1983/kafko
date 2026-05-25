@@ -1,0 +1,57 @@
+[package]
+name = "kafko-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+crc32fast = "1"
+kafko = { path = "../crates/kafko" }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[[bin]]
+name = "decode_record"
+path = "fuzz_targets/decode_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_record_structured"
+path = "fuzz_targets/decode_record_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recovery_torn_tail"
+path = "fuzz_targets/recovery_torn_tail.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sparse_index_parse"
+path = "fuzz_targets/sparse_index_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log_op_sequence"
+path = "fuzz_targets/log_op_sequence.rs"
+test = false
+doc = false
+bench = false
+
+# cargo-fuzz convention: this crate is its own workspace root, not a member
+# of the parent kafko workspace. The parent workspace also excludes "fuzz",
+# so regular cargo commands at the repo root don't touch this crate.
+[workspace]

@@ -226,6 +226,136 @@ async fn log_with_lz4_uses_fewer_bytes_on_disk() {
 }
 
 #[tokio::test]
+async fn single_record_larger_than_threshold_on_empty_log_succeeds() {
+    // Regression for the v0.1.0 bug where Segment::would_overflow returned true
+    // for an empty segment, causing rotation to try to create a duplicate segment
+    // at base offset 0 and fail with AlreadyExists. The empty active segment must
+    // always accept the first write, even if the record exceeds threshold.
+    let dir = TempDir::new().unwrap();
+    let cfg = LogConfig {
+        segment_size_threshold: 128,
+        ..Default::default()
+    };
+    let mut log = Log::create(dir.path(), cfg).await.unwrap();
+
+    // A single record whose wire form clearly exceeds 128 bytes.
+    let r = Record::new(0, None, Bytes::from(vec![0u8; 1024]));
+    let offset = log.append(r.clone()).await.unwrap();
+    assert_eq!(offset, 0);
+    assert_eq!(log.segment_count(), 1, "no premature rotation on empty segment");
+    let read_back = log.read_record_at(0).await.unwrap();
+    assert_eq!(read_back, Some(r));
+}
+
+#[tokio::test]
+async fn batch_larger_than_threshold_on_empty_log_succeeds() {
+    // Same defect class as the single-record case, exercised through append_batch.
+    let dir = TempDir::new().unwrap();
+    let cfg = LogConfig {
+        segment_size_threshold: 128,
+        ..Default::default()
+    };
+    let mut log = Log::create(dir.path(), cfg).await.unwrap();
+
+    let records: Vec<Record> = (0..32).map(record).collect();
+    let offsets = log.append_batch(records.clone()).await.unwrap();
+    assert_eq!(offsets, (0..32).collect::<Vec<u64>>());
+    assert_eq!(log.segment_count(), 1);
+
+    for (i, expected) in records.into_iter().enumerate() {
+        assert_eq!(log.read_record_at(i as u64).await.unwrap(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn append_after_oversized_first_write_rotates_normally() {
+    // Once a segment has content, the soft cap applies normally: the next write
+    // that would push it past threshold triggers rotation.
+    let dir = TempDir::new().unwrap();
+    let cfg = LogConfig {
+        segment_size_threshold: 128,
+        ..Default::default()
+    };
+    let mut log = Log::create(dir.path(), cfg).await.unwrap();
+
+    // First write is oversized → stays in segment 0.
+    log.append(Record::new(0, None, Bytes::from(vec![0xAAu8; 1024])))
+        .await
+        .unwrap();
+    assert_eq!(log.segment_count(), 1);
+
+    // Any subsequent append rotates because the segment is now full.
+    log.append(Record::new(1, None, Bytes::from_static(b"small")))
+        .await
+        .unwrap();
+    assert!(
+        log.segment_count() >= 2,
+        "expected rotation after oversized seg-0 + new append, got {} segment(s)",
+        log.segment_count()
+    );
+
+    // Both records are still readable.
+    assert!(log.read_record_at(0).await.unwrap().is_some());
+    assert!(log.read_record_at(1).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn mid_life_rotation_mix_preserves_ordering() {
+    // Small + small + huge + small + small mix, all readable in order.
+    let dir = TempDir::new().unwrap();
+    let cfg = LogConfig {
+        segment_size_threshold: 256,
+        ..Default::default()
+    };
+    let mut log = Log::create(dir.path(), cfg).await.unwrap();
+
+    let records = vec![
+        Record::new(0, None, Bytes::from_static(b"small-0")),
+        Record::new(1, None, Bytes::from_static(b"small-1")),
+        Record::new(2, None, Bytes::from(vec![0u8; 4096])), // oversized
+        Record::new(3, None, Bytes::from_static(b"small-3")),
+        Record::new(4, None, Bytes::from_static(b"small-4")),
+    ];
+    for r in &records {
+        log.append(r.clone()).await.unwrap();
+    }
+    log.sync().await.unwrap();
+
+    for (i, expected) in records.iter().enumerate() {
+        let actual = log.read_record_at(i as u64).await.unwrap();
+        assert_eq!(actual.as_ref(), Some(expected), "mismatch at offset {i}");
+    }
+    assert_eq!(log.next_offset(), 5);
+}
+
+#[tokio::test]
+async fn append_at_exact_threshold_boundary_does_not_double_rotate() {
+    // After fill-to-threshold, the next append triggers exactly one rotation —
+    // it should not create extra empty segments.
+    let dir = TempDir::new().unwrap();
+    let cfg = LogConfig {
+        segment_size_threshold: 200,
+        ..Default::default()
+    };
+    let mut log = Log::create(dir.path(), cfg).await.unwrap();
+
+    // Fill close to threshold with small records.
+    for i in 0..5 {
+        log.append(record(i)).await.unwrap();
+    }
+    let before = log.segment_count();
+
+    // One more append must rotate at most once (segment_count grows by 1 or stays
+    // the same depending on where exactly we crossed the threshold).
+    log.append(record(99)).await.unwrap();
+    let after = log.segment_count();
+    assert!(
+        after - before <= 1,
+        "expected at most one rotation, segment_count went {before} -> {after}"
+    );
+}
+
+#[tokio::test]
 async fn append_batch_continues_offsets_after_individual_appends() {
     let dir = TempDir::new().unwrap();
     let mut log = Log::create(dir.path(), default_config()).await.unwrap();

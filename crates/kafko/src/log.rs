@@ -405,10 +405,10 @@ async fn discover_segment_offsets(dir: &Path) -> Result<Vec<u64>> {
             Some(s) => s,
             None => continue,
         };
-        if let Some(prefix) = name_str.strip_suffix(".log") {
-            if let Ok(base) = prefix.parse::<u64>() {
-                offsets.push(base);
-            }
+        if let Some(prefix) = name_str.strip_suffix(".log")
+            && let Ok(base) = prefix.parse::<u64>()
+        {
+            offsets.push(base);
         }
     }
     offsets.sort();
