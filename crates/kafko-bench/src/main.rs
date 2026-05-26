@@ -1,55 +1,62 @@
-// kafko-bench -- run kafko's append matrix in-process so the resulting profile
-// shows storage + tokio task scheduling without HTTP/axum machinery dominating
-// the flame graph.
+// kafko-bench -- focused per-scenario harness for profiling kafko's hot path.
 //
-// Workload mirrors the kafko-http samply bench: 6 record sizes x 3 codecs x
-// CONCURRENCY tasks per cell, each task awaits its own Producer::send loop.
-// The binary exits as soon as the matrix finishes, so a wrapping `samply record`
-// observes child exit naturally and flushes the profile without any signal
-// gymnastics.
+// Picks ONE scenario via the KAFKO_SCENARIO env var and runs only that, so
+// hotpath counters reflect a single access pattern without cross-contamination.
+// All scenarios use the same record size (256 B), no key, no compression --
+// the baseline cell -- so per-function timing differences across scenarios
+// isolate the access pattern, not the codec or payload.
+//
+// Scenarios:
+//   sequential  -- 1 producer, N=100_000 single send() calls in a tight loop.
+//                  Answers Gap 1: where does the ~3.7 us per-send go?
+//                  Hotpath functions to compare: Partition::append (outer cost)
+//                  vs flush_append_batch (writer-side cost). The delta is the
+//                  mpsc-send + oneshot-wait overhead.
+//
+//   concurrent  -- 16 long-lived producer tasks, each doing 6_250 sends.
+//                  Answers Gap 2: is natural-batching helping under contention?
+//                  Aggregate throughput vs sequential answers "does parallelism
+//                  help or hurt with one writer task as the serialization point?"
+//                  Look at flush_append_batch's call count + mean per-call cost
+//                  vs sequential's -- a higher mean per call = effective batching.
+//
+//   batch       -- 1 producer, K=97 calls of send_batch(1024). Reference ceiling.
+//                  Saturates the writer task and amortizes mpsc cost across 1024
+//                  records per round-trip. Hotpath should show append_batch
+//                  dominating and Partition::append unused.
 //
 // Environment variables:
-//   KAFKO_BENCH_DATA_DIR  data dir for the broker (default ./kafko-bench_data)
+//   KAFKO_SCENARIO        sequential | concurrent | batch   (required)
+//   KAFKO_BENCH_DATA_DIR  data dir for the broker             (default ./kafko-bench_data)
 //   KAFKO_RESET           if set, wipe the data dir at startup
 //
-// This binary is intentionally test-only (publish = false). It is NOT shipped
-// to crates.io and is not part of the kafko library's public API.
+// This binary is intentionally test-only (publish = false).
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use kafko::{Compression, Kafko, LogConfig};
 use std::sync::Arc;
 use std::time::Instant;
 
-const SIZES: &[usize] = &[64, 256, 1024, 4096, 131_072, 1_048_576];
-const CODECS: &[(&str, Compression)] = &[
-    ("bench_none", Compression::None),
-    ("bench_lz4", Compression::Lz4),
-    ("bench_zstd", Compression::Zstd),
-];
-const CONCURRENCY: usize = 16;
+const VALUE_SIZE: usize = 256;
+const TOTAL_RECORDS_TARGET: u64 = 100_000;
 
-// Records per cell: tuned to match the kafko-http samply bench so profile
-// shapes are comparable. Debug build is slow; numbers here are smaller than
-// the release HTTP bench on purpose.
-fn target_records(size: usize) -> u64 {
-    if size >= 1_048_576 {
-        200
-    } else if size >= 131_072 {
-        500
-    } else if size >= 4_096 {
-        5_000
-    } else {
-        50_000
-    }
-}
+const SEQUENTIAL_TOPIC: &str = "scenario_sequential";
+const CONCURRENT_TOPIC: &str = "scenario_concurrent";
+const BATCH_TOPIC: &str = "scenario_batch";
 
-// hotpath's docs say to write #[tokio::main] above #[hotpath::main]. The
-// cfg_attr makes hotpath::main appear only when the feature is on; without
-// it the build is identical to a plain tokio::main async fn.
+const CONCURRENT_TASKS: u64 = 16;
+const BATCH_SIZE: u64 = 1024;
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(feature = "hotpath", hotpath::main)]
 async fn main() -> Result<()> {
+    let scenario = std::env::var("KAFKO_SCENARIO").unwrap_or_default();
+    if scenario.is_empty() {
+        print_usage();
+        return Err(anyhow!("KAFKO_SCENARIO is required"));
+    }
+
     let data_dir = std::env::var("KAFKO_BENCH_DATA_DIR")
         .unwrap_or_else(|_| "./kafko-bench_data".to_string());
 
@@ -59,56 +66,38 @@ async fn main() -> Result<()> {
 
     let broker = Arc::new(Kafko::open(&data_dir).await?);
 
-    for (name, codec) in CODECS {
-        let cfg = LogConfig {
-            compression: *codec,
-            ..Default::default()
-        };
-        broker.create_topic_with_config(name, cfg).await?;
-    }
-
-    eprintln!(
-        "kafko in-process bench: {} sizes x {} codecs x {} concurrency, no HTTP",
-        SIZES.len(),
-        CODECS.len(),
-        CONCURRENCY,
-    );
-    eprintln!("data dir: {data_dir}");
+    eprintln!("kafko-bench scenario={scenario}");
+    eprintln!("  data dir : {data_dir}");
+    eprintln!("  payload  : {VALUE_SIZE} B, no key, no compression");
+    eprintln!("  target   : ~{TOTAL_RECORDS_TARGET} records");
     eprintln!();
 
-    let bench_start = Instant::now();
-
-    for (topic, _codec) in CODECS {
-        eprintln!("============================================================");
-        eprintln!(" TOPIC: {topic}");
-        eprintln!("============================================================");
-
-        for &size in SIZES {
-            run_cell(&broker, topic, size).await?;
+    let elapsed = match scenario.as_str() {
+        "sequential" => run_sequential(&broker).await?,
+        "concurrent" => run_concurrent(&broker).await?,
+        "batch" => run_batch(&broker).await?,
+        other => {
+            print_usage();
+            return Err(anyhow!("unknown scenario '{other}'"));
         }
-    }
+    };
 
-    let total_elapsed = bench_start.elapsed();
     eprintln!();
-    eprintln!("=== DONE in {:.2}s ===", total_elapsed.as_secs_f64());
+    eprintln!("=== scenario '{scenario}' done in {:.3}s ===", elapsed.as_secs_f64());
 
-    // Explicit shutdown so the active segment is fsynced and the data-dir
-    // lock is released before the process exits. Lets samply observe a clean
-    // process tree termination.
     Arc::try_unwrap(broker)
-        .map_err(|_| anyhow::anyhow!("broker still has outstanding clones at shutdown"))?
+        .map_err(|_| anyhow!("broker still has outstanding clones at shutdown"))?
         .shutdown()
         .await?;
 
-    // When the MCP server is enabled, keep the process alive after the bench
-    // matrix completes so an LLM agent (or anyone with an MCP client) can
-    // query the accumulated metrics. Hotpath's counters live in process
-    // memory; shutting down kafko doesn't clear them, only process exit does.
+    // When the MCP server is enabled, keep the process alive so an MCP client
+    // can query the accumulated per-function counters. They live in process
+    // memory; only process exit clears them.
     #[cfg(feature = "hotpath-mcp")]
     {
         eprintln!();
         eprintln!("------------------------------------------------------------");
-        eprintln!(" Hotpath MCP server is running. Bench results above.");
+        eprintln!(" Hotpath MCP server is running. Scenario complete.");
         eprintln!(" Press Ctrl+C to exit when you're done querying.");
         eprintln!("------------------------------------------------------------");
         let _ = tokio::signal::ctrl_c().await;
@@ -118,22 +107,49 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_cell(broker: &Kafko, topic: &str, size: usize) -> Result<()> {
-    let total = target_records(size);
-    let per_task = (total / CONCURRENCY as u64).max(1);
-    let total_actual = per_task * CONCURRENCY as u64;
-
+fn print_usage() {
+    eprintln!("usage: KAFKO_SCENARIO=<scenario> kafko-bench");
     eprintln!();
-    eprintln!(
-        "=== size={size}B topic={topic} concurrency={CONCURRENCY} per_task={per_task} total={total_actual} ===",
-    );
+    eprintln!("scenarios:");
+    eprintln!("  sequential   1 producer, {TOTAL_RECORDS_TARGET} sequential send() calls");
+    eprintln!("  concurrent   {CONCURRENT_TASKS} producers, ~{TOTAL_RECORDS_TARGET} sends total");
+    eprintln!("  batch        1 producer, send_batch({BATCH_SIZE}) repeated to ~{TOTAL_RECORDS_TARGET} records");
+}
 
-    let producer = broker.producer_for(topic).await?;
-    let payload = Bytes::from(vec![0u8; size]);
+async fn run_sequential(broker: &Kafko) -> Result<std::time::Duration> {
+    broker
+        .create_topic_with_config(SEQUENTIAL_TOPIC, default_cfg())
+        .await?;
+    let producer = broker.producer_for(SEQUENTIAL_TOPIC).await?;
+    let payload = Bytes::from(vec![0u8; VALUE_SIZE]);
+
+    let n = TOTAL_RECORDS_TARGET;
+    eprintln!("running sequential: 1 task x {n} sends");
 
     let start = Instant::now();
-    let mut handles = Vec::with_capacity(CONCURRENCY);
-    for _ in 0..CONCURRENCY {
+    for _ in 0..n {
+        producer.send(None, payload.clone()).await?;
+    }
+    let elapsed = start.elapsed();
+
+    report("sequential", n, elapsed, None);
+    Ok(elapsed)
+}
+
+async fn run_concurrent(broker: &Kafko) -> Result<std::time::Duration> {
+    broker
+        .create_topic_with_config(CONCURRENT_TOPIC, default_cfg())
+        .await?;
+    let producer = broker.producer_for(CONCURRENT_TOPIC).await?;
+    let payload = Bytes::from(vec![0u8; VALUE_SIZE]);
+
+    let per_task = TOTAL_RECORDS_TARGET / CONCURRENT_TASKS;
+    let total = per_task * CONCURRENT_TASKS;
+    eprintln!("running concurrent: {CONCURRENT_TASKS} tasks x {per_task} sends each (= {total} total)");
+
+    let start = Instant::now();
+    let mut handles = Vec::with_capacity(CONCURRENT_TASKS as usize);
+    for _ in 0..CONCURRENT_TASKS {
         let p = producer.clone();
         let payload = payload.clone();
         handles.push(tokio::spawn(async move {
@@ -148,15 +164,53 @@ async fn run_cell(broker: &Kafko, topic: &str, size: usize) -> Result<()> {
     }
     let elapsed = start.elapsed();
 
-    let rec_per_s = total_actual as f64 / elapsed.as_secs_f64();
-    let mib_per_s =
-        (total_actual * size as u64) as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
-    eprintln!(
-        "  {:.3}s  ({:.0} rec/s, {:.1} MiB/s)",
-        elapsed.as_secs_f64(),
-        rec_per_s,
-        mib_per_s,
-    );
+    report("concurrent", total, elapsed, Some(CONCURRENT_TASKS));
+    Ok(elapsed)
+}
 
-    Ok(())
+async fn run_batch(broker: &Kafko) -> Result<std::time::Duration> {
+    broker
+        .create_topic_with_config(BATCH_TOPIC, default_cfg())
+        .await?;
+    let producer = broker.producer_for(BATCH_TOPIC).await?;
+    let payload = Bytes::from(vec![0u8; VALUE_SIZE]);
+
+    let batches = TOTAL_RECORDS_TARGET.div_ceil(BATCH_SIZE);
+    let total = batches * BATCH_SIZE;
+    eprintln!("running batch: 1 task x {batches} batches of {BATCH_SIZE} (= {total} total)");
+
+    let start = Instant::now();
+    for _ in 0..batches {
+        let items: Vec<(Option<Bytes>, Bytes)> = (0..BATCH_SIZE)
+            .map(|_| (None, payload.clone()))
+            .collect();
+        producer.send_batch(items).await?;
+    }
+    let elapsed = start.elapsed();
+
+    report("batch", total, elapsed, None);
+    Ok(elapsed)
+}
+
+fn report(name: &str, total_records: u64, elapsed: std::time::Duration, tasks: Option<u64>) {
+    let secs = elapsed.as_secs_f64();
+    let rec_per_s = total_records as f64 / secs;
+    let bytes = total_records * VALUE_SIZE as u64;
+    let mib_per_s = bytes as f64 / secs / (1024.0 * 1024.0);
+    eprintln!();
+    eprintln!("scenario {name}:");
+    eprintln!("  total records : {total_records}");
+    eprintln!("  elapsed       : {secs:.3} s");
+    eprintln!("  throughput    : {rec_per_s:.0} rec/s  ({mib_per_s:.1} MiB/s value bytes)");
+    if let Some(n_tasks) = tasks {
+        let per_task = rec_per_s / n_tasks as f64;
+        eprintln!("  per task      : {per_task:.0} rec/s ({n_tasks} tasks)");
+    }
+}
+
+fn default_cfg() -> LogConfig {
+    LogConfig {
+        compression: Compression::None,
+        ..Default::default()
+    }
 }

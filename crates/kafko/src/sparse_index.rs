@@ -112,6 +112,7 @@ impl SparseIndex {
     /// `file_position`, occupying `record_size` bytes. Adds an index entry if
     /// the running byte count since the last entry exceeds `interval` (or if
     /// this is the first entry).
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn track_append(
         &mut self,
         absolute_offset: u64,
