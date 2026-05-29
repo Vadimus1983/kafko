@@ -17,6 +17,8 @@ Run all scripts **from the project root** (e.g. `.\scripts\kafko_docker_bench.ps
 | `kafka_bench_max.ps1` | Kafka tuned for maximum throughput — large socket buffers, 8 io/network threads, `linger.ms=50`, dynamic `batch.size` and `buffer.memory`, 1 GiB heap. Shows Kafka's natural batched throughput. | `kafka_bench_max_results_<ts>.txt` |
 | `kafka_bench_unbatched.ps1` | **Apples-to-apples** Kafka bench: 16 concurrent producers with `linger.ms=0`, `batch.size=size+1024`, `max.in.flight.requests.per.connection=1`. Forces Kafka into the same one-record-per-request shape as `kafko-http`. | `kafka_bench_unbatched_results_<ts>.txt` |
 | `kafka_bench.sh` | Bash port of `kafka_bench.ps1` for Linux / macOS / WSL. Same matrix, same output schema. | `kafka_bench_results_<ts>.txt` |
+| `kafko_hotpath_matrix.ps1` | **In-process hotpath measurement matrix.** Builds `kafko-bench` with `hotpath hotpath-alloc compression-lz4` and runs each scenario (`sequential`, `concurrent`, `batch`, `lz4_sequential`) in its own process so per-function timing and allocation tables stay clean. Used to verify the LZ4 alloc-amortization fix in v0.2.0. | `hotpath_<ts>/<scenario>.txt` + `summary.txt` |
+| `kafko_lib_multisize_bench.ps1` | **In-process throughput across record sizes.** Builds `kafko-bench` with `compression-all` and runs the `sequential` / `lz4_sequential` / `zstd_sequential` scenarios at six record sizes (64 B - 1 MiB) per codec, each in its own process with its own data dir. Drives the README's "Library hot path - records/sec (single send per record)" table. | `kafko_lib_multisize_<ts>/cell_<size>_<codec>.txt` + `results.txt` + `results.csv` |
 
 `<ts>` is the script's start time as `YYYYMMDD-HHMMSS`, so re-runs never overwrite earlier results. The entire `scripts/tmp/` directory is gitignored, so nothing produced by a bench run ever lands in commits. Delete the whole folder whenever you want to clean up.
 
@@ -39,7 +41,7 @@ The Docker scripts don't need a host-side run folder: the container *is* the run
 ## Quick choices
 
 - **Comparing kafko vs Kafka fairly** → run `kafko_docker_bench.ps1` + `kafka_bench_unbatched.ps1`. Both put server and client inside their own container; both use one record per network call. Numbers from these two files are directly comparable.
-- **Comparing kafko vs production-tuned Kafka** → run `kafko_docker_bench.ps1` + `kafka_bench_max.ps1`. Kafka wins on small-record throughput because client-side batching is its native mode. This is the comparison Kafka's design assumes; kafko will close the gap once `Producer::send_batch` lands in v0.2.
+- **Comparing kafko vs production-tuned Kafka** → run `kafko_docker_bench.ps1` + `kafka_bench_max.ps1`. Kafka wins on small-record throughput because client-side batching is its native mode. This is the comparison Kafka's design assumes; kafko narrows the gap via `Producer::send_batch` (shipped in v0.1.1) for clients that can stage records.
 - **Local kafko sanity check (no Docker)** → `kafko_http_bench.ps1` builds and runs everything on the host.
 - **Find a kafko hot spot** → two flavours of profiling. Pick by what you want to see in the flame graph:
   - `kafko_lib_samply_bench.ps1` — **storage path only.** Runs `kafko-bench` (an in-process workload binary in the workspace), no HTTP / axum / oha. Best for tuning the partition writer, segment append, CRC, compression, fsync paths.

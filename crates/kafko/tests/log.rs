@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use kafko::{Compression, Log, LogConfig, Record};
+#[cfg(feature = "compression-lz4")]
+use kafko::Compression;
+use kafko::{Log, LogConfig, Record};
 use tempfile::TempDir;
 
 fn record(marker: u64) -> Record {
@@ -171,6 +173,7 @@ async fn append_batch_empty_returns_empty() {
     assert_eq!(log.next_offset(), 0);
 }
 
+#[cfg(feature = "compression-lz4")]
 #[tokio::test]
 async fn log_with_lz4_compression_roundtrips() {
     let dir = TempDir::new().unwrap();
@@ -190,6 +193,7 @@ async fn log_with_lz4_compression_roundtrips() {
     assert_eq!(read_back, Some(expected));
 }
 
+#[cfg(feature = "compression-lz4")]
 #[tokio::test]
 async fn log_with_lz4_uses_fewer_bytes_on_disk() {
     let base = TempDir::new().unwrap();

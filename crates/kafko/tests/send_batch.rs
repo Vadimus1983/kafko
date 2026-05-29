@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use kafko::{Compression, Kafko, LogConfig, Partition, Record};
+#[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
+use kafko::Compression;
+use kafko::{Kafko, LogConfig, Partition, Record};
 use tempfile::TempDir;
 
 #[tokio::test]
@@ -180,6 +182,7 @@ async fn send_batch_propagates_io_error_to_caller() {
     p.shutdown().await.unwrap();
 }
 
+#[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
 async fn send_batch_round_trip_with_compression(compression: Compression) {
     let dir = TempDir::new().unwrap();
     let broker = Kafko::open_with_config(
@@ -215,11 +218,13 @@ async fn send_batch_round_trip_with_compression(compression: Compression) {
     }
 }
 
+#[cfg(feature = "compression-lz4")]
 #[tokio::test]
 async fn send_batch_lz4_compressed_round_trip() {
     send_batch_round_trip_with_compression(Compression::Lz4).await;
 }
 
+#[cfg(feature = "compression-zstd")]
 #[tokio::test]
 async fn send_batch_zstd_compressed_round_trip() {
     send_batch_round_trip_with_compression(Compression::Zstd).await;

@@ -69,11 +69,17 @@ fn bench_send_batch_none(c: &mut Criterion) {
 }
 
 fn bench_send_batch_lz4(c: &mut Criterion) {
+    #[cfg(feature = "compression-lz4")]
     bench_send_batch_by_size(c, "send_batch_lz4", Compression::Lz4);
+    #[cfg(not(feature = "compression-lz4"))]
+    let _ = c;
 }
 
 fn bench_send_batch_zstd(c: &mut Criterion) {
+    #[cfg(feature = "compression-zstd")]
     bench_send_batch_by_size(c, "send_batch_zstd", Compression::Zstd);
+    #[cfg(not(feature = "compression-zstd"))]
+    let _ = c;
 }
 
 // For reference: an equivalent loop of N single appends at the same value size,

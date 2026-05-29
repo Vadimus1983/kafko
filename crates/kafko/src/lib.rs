@@ -79,3 +79,6 @@ pub use producer::Producer;
 pub use record::Record;
 pub use segment::Segment;
 pub use sparse_index::SparseIndex;
+
+
+

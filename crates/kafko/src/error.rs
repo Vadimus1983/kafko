@@ -1,3 +1,4 @@
+use crate::compression::Compression;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -67,6 +68,13 @@ pub enum KafkoError {
     #[error("decompression failed")]
     DecompressionFailed,
 
+    /// A record was produced or read with a [`Compression`] variant whose
+    /// Cargo feature is not enabled in this build of kafko. Rebuild with
+    /// `--features compression-lz4` / `compression-zstd` / `compression-all`
+    /// to handle this codec.
+    #[error("compression codec {0:?} is not enabled in this build; rebuild kafko with the matching `compression-*` feature")]
+    CompressionUnavailable(Compression),
+
     /// Another `Kafko::open` already holds the advisory lock on this data dir.
     /// Either close the existing broker, or point at a different directory.
     #[error("data directory {} is already opened by another Kafko instance (file lock held)", .path.display())]
@@ -106,6 +114,7 @@ impl Clone for KafkoError {
             KafkoError::TopicInUse(s) => KafkoError::TopicInUse(s.clone()),
             KafkoError::UnknownCompression(b) => KafkoError::UnknownCompression(*b),
             KafkoError::DecompressionFailed => KafkoError::DecompressionFailed,
+            KafkoError::CompressionUnavailable(c) => KafkoError::CompressionUnavailable(*c),
             KafkoError::AlreadyOpen { path } => KafkoError::AlreadyOpen {
                 path: path.clone(),
             },

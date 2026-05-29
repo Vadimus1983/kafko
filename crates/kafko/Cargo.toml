@@ -1,6 +1,6 @@
 [package]
 name = "kafko"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "In-process log with Kafka-like semantics: topics, partitions, offset-based reads, replay, retention."
 license = "MIT OR Apache-2.0"
@@ -21,9 +21,15 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "rt-multi-
 bytes = "1"
 crc32fast = "1"
 fs4 = "0.13"
-lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 thiserror = "2.0.18"
-zstd = "0.13"
+
+# Compression codecs are optional; the published crate ships with no compression
+# dependencies. Users opt in via `compression-lz4` / `compression-zstd` /
+# `compression-all`. `Compression::Lz4` and `Compression::Zstd` are always
+# visible in the public API so on-disk records can be parsed and a friendly
+# CompressionUnavailable error returned when the matching feature is off.
+lz4_flex = { version = "0.13", default-features = false, features = ["std"], optional = true }
+zstd = { version = "0.13", optional = true }
 
 # Optional: per-function instrumentation profiler. Disabled by default so the
 # published library has zero dep weight. Enable via the `hotpath` feature only
@@ -33,6 +39,15 @@ hotpath = { version = "0.16.1", optional = true }
 [features]
 default = []
 hotpath = ["dep:hotpath", "hotpath/hotpath"]
+compression-lz4 = ["dep:lz4_flex"]
+compression-zstd = ["dep:zstd"]
+compression-all = ["compression-lz4", "compression-zstd"]
+
+# docs.rs builds with all-features so Compression::Lz4 and Compression::Zstd
+# (and their feature-gated impl notes) are documented in full.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
 proptest = "1"

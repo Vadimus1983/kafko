@@ -185,7 +185,7 @@ impl Log {
         }
 
         let mut buf = BytesMut::with_capacity(wire_size_estimate);
-        let actual_size = record.encode_with(&mut buf, compression);
+        let actual_size = record.encode_with(&mut buf, compression)?;
 
         let active = self
             .segments
@@ -232,7 +232,7 @@ impl Log {
         for record in records {
             offsets.push(current_offset);
             current_offset += 1;
-            let actual = record.encode_with(&mut self.encode_buf, compression);
+            let actual = record.encode_with(&mut self.encode_buf, compression)?;
             self.actual_sizes.push(actual);
         }
 

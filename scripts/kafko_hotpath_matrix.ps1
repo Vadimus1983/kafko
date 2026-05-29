@@ -41,7 +41,7 @@ $Timestamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
 $OutDir    = Join-Path $TmpDir "hotpath_$Timestamp"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-$Features = 'hotpath hotpath-alloc'
+$Features = 'hotpath hotpath-alloc compression-lz4'
 
 Write-Host "kafko hotpath measurement matrix"
 Write-Host "  features : $Features"
@@ -68,7 +68,9 @@ if (-not (Test-Path $BinaryRel)) {
 $BinaryPath = (Resolve-Path $BinaryRel).Path
 
 # --- Run each scenario in its own process ---
-$Scenarios = @('sequential', 'concurrent', 'batch')
+# lz4_sequential mirrors `sequential` but routes through Compression::Lz4 so
+# the alloc table can isolate compression::compress's heap traffic.
+$Scenarios = @('sequential', 'concurrent', 'batch', 'lz4_sequential')
 $summaryLines = @()
 
 foreach ($scenario in $Scenarios) {
@@ -140,6 +142,9 @@ Write-Host "  Partition::append vs flush_append_batch -- delta = mpsc+oneshot ov
 Write-Host "  Segment::append mean time              -- the write() syscall cost"
 Write-Host "  Record::encode_with mean time          -- the codec+CRC cost"
 Write-Host "  SparseIndex::track_append call count   -- index update pressure"
+Write-Host "  compression::compress alloc row        -- look at lz4_sequential.txt; total"
+Write-Host "                                            bytes should be ~8 KiB (one table per"
+Write-Host "                                            encoder thread), NOT N x 8 KiB."
 
 } finally {
     Pop-Location

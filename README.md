@@ -44,9 +44,16 @@ The killer use case isn't "replace Kafka." It's **testing log-shaped application
 
 ```toml
 [dependencies]
-kafko = "0.1"
+kafko = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 bytes = "1"
+```
+
+To use a compression codec, opt in via Cargo features — see
+[Compression features](#compression-features):
+
+```toml
+kafko = { version = "0.2", features = ["compression-lz4"] }
 ```
 
 ```rust
@@ -86,6 +93,25 @@ broker
     )
     .await?;
 ```
+
+### Compression features
+
+LZ4 and Zstd are opt-in via Cargo features, so a default `cargo add kafko`
+pulls in no compression dependencies. Pick what you need:
+
+| Feature | Adds to deps | Enables variant |
+|---|---|---|
+| _(default)_ | _(nothing)_ | `Compression::None` only |
+| `compression-lz4` | `lz4_flex 0.13` | `Compression::Lz4` |
+| `compression-zstd` | `zstd 0.13` | `Compression::Zstd` |
+| `compression-all` | both above | both |
+
+The `Compression::Lz4` and `Compression::Zstd` variants are visible in the
+public API regardless of features — a build without the matching codec returns
+`KafkoError::CompressionUnavailable(codec)` instead of mis-decoding bytes,
+so a reader built without (e.g.) LZ4 can still detect and gracefully reject
+segments written by an LZ4-enabled producer. Call `Compression::is_available()`
+for a runtime check.
 
 ## Architecture
 
@@ -160,93 +186,114 @@ Reproducible from `scripts/kafko_docker_bench.ps1` (HTTP) and `cargo run --relea
 | Compression codecs | none / lz4 / zstd (per-topic) | same |
 | Runtime | `multi_thread`, default worker count (one per logical CPU) | `multi_thread, worker_threads = 4` |
 
-### HTTP path — records/sec (16 concurrent producers, wall-clock aggregate)
+### HTTP path — records/sec (16 concurrent producers, wall-clock aggregate, v0.2.0)
 
 | Size | none | lz4 | zstd |
 |---|---:|---:|---:|
-| 64 B    | 139,037 | 139,077 | 125,207 |
-| 256 B   | 137,057 | 138,972 | 125,603 |
-| 512 B   | 134,196 | 137,229 | 126,404 |
-| 1 KiB   | 134,435 | 136,338 | 123,555 |
-| 4 KiB   |  38,774 | 130,602 | 117,388 |
-| 128 KiB |  13,113 |  57,842 |  44,259 |
-| 1 MiB   |     818 |   6,193 |   4,834 |
+| 64 B    | 138,235 | 138,422 | 123,325 |
+| 256 B   | 135,296 | 131,267 | 124,534 |
+| 512 B   | 130,665 | 133,469 | 122,423 |
+| 1 KiB   | 128,327 | 132,557 | 123,312 |
+| 4 KiB   |  52,667 | 127,308 | 110,416 |
+| 128 KiB |  12,123 |  40,426 |  44,621 |
+| 1 MiB   |     976 |   6,109 |   4,787 |
 
-### HTTP path — MiB/s committed
+### HTTP path — MiB/s committed (v0.2.0)
 
 | Size | none | lz4 | zstd |
 |---|---:|---:|---:|
-| 64 B    |     8.5 |     8.5 |     7.6 |
-| 256 B   |    33.5 |    33.9 |    30.7 |
-| 1 KiB   |   131.3 |   133.1 |   120.7 |
-| 4 KiB   |   151.5 | **510.2** | **458.5** |
-| 128 KiB | **1,639** | **7,230** | **5,532** |
-| 1 MiB   |     818 |   6,193 |   4,834 |
+| 64 B    |     8.4 |     8.4 |     7.5 |
+| 256 B   |    33.0 |    32.0 |    30.4 |
+| 1 KiB   |   125.3 |   129.5 |   120.4 |
+| 4 KiB   |   205.7 | **497.3** | **431.3** |
+| 128 KiB | **1,516** | **5,053** | **5,578** |
+| 1 MiB   |     976 |   6,109 |   4,787 |
 
-### HTTP path — latency p50 (codec = none)
+### HTTP path — latency p50 (codec = none, v0.2.0)
 
 | Size | p50 |
 |---|---:|
 | 64 B    | 0.11 ms |
 | 256 B   | 0.11 ms |
 | 512 B   | 0.11 ms |
-| 1 KiB   | 0.11 ms |
-| 4 KiB   | 0.14 ms |
-| 128 KiB | 1.21 ms |
-| 1 MiB   | 9.22 ms |
+| 1 KiB   | 0.12 ms |
+| 4 KiB   | 0.16 ms |
+| 128 KiB | 1.29 ms |
+| 1 MiB   | 10.43 ms |
 
 Latency is `oha`'s synchronous-per-connection request-response time (send → wait → receive → next), so this is honest end-to-end HTTP RTT through the kafko stack including write-to-page-cache.
 
-### Library hot path — records/sec (in-process, no HTTP)
+### Library hot path — records/sec (in-process, no HTTP, single `send()` per record, v0.2.0)
 
-For users who plan to embed kafko directly — the killer use case — the library-only numbers are higher because there is no HTTP, axum, or `oha` overhead in the path.
+For users who embed kafko directly — the killer use case — the library-only numbers below show **single-`send()` per record** throughput across record sizes. Each row is `kafko-bench --features compression-all` driving 1 producer in a tight loop of `producer.send().await` calls; one round-trip through the partition writer per record.
 
 | Size | none | lz4 | zstd |
 |---|---:|---:|---:|
-| 64 B    | 1,122,798 | 1,323,455 |   689,843 |
-| 256 B   |   904,190 | 1,382,915 |   692,955 |
-| 1 KiB   |   560,482 | 1,158,094 |   676,439 |
-| 4 KiB   |   253,589 | 1,043,108 |   622,537 |
-| 128 KiB |    22,245 |    95,816 |   131,684 |
-| 1 MiB   |     3,264 |    13,402 |     7,432 |
+| 64 B    |   282,619 |   285,377 |   238,996 |
+| 256 B   |   273,199 |   286,711 |   238,283 |
+| 1 KiB   |   216,075 |   267,409 |   242,199 |
+| 4 KiB   |   120,315 |   260,233 |   228,961 |
+| 128 KiB |    11,128 |    51,606 |    52,127 |
+| 1 MiB   |     3,032 |    10,561 |     5,283 |
 
-Small-record cells are nearly 10× the HTTP-path numbers — that's the cost of HTTP serialization, TCP setup, and axum routing per request. Library users skip all of it.
+**LZ4 beats `None` at every size** in v0.2.0 — at small records the per-call hash-table alloc is gone (see [Codec allocation profile](#codec-allocation-profile-v020)), and at large records the smaller on-disk write more than pays for the compression CPU. The 4 KiB cell is where `Compression::Lz4` first pulls clearly ahead: 260 K rec/s vs `None`'s 120 K, a 2.2× speedup.
 
-Function-level timing + allocation snapshots and full methodology in `crates/kafko-bench/baselines/`.
+For **batched** throughput at the same record size, see the `send_batch` table below — small-record amortization there reaches **3.66 M rec/s** for `None` and **4.05 M rec/s** for `Lz4` at N = 1024.
 
-### Library hot path — `send_batch` vs single `send` (v0.1.1, 256 B records)
+Reproduce: `.\scripts\kafko_lib_multisize_bench.ps1`. Function-level timing + allocation snapshots and full methodology in `crates/kafko-bench/baselines/`.
+
+### Library hot path — `send_batch` vs single `send` (v0.2.0, 256 B records)
 
 Same in-process path as above, but driven by `cargo bench -p kafko --bench send_batch` so a single producer either calls `send_batch(N)` once or loops N single `send()` calls. The gap is the mpsc round-trip cost saved per record.
 
 | Records per call (N) | `send_batch(N)` | Loop of N × `send()` | **Speedup** |
 |---:|---:|---:|---:|
-| 1 | 273 K rec/s | 272 K rec/s | 1.0× |
-| 8 | 635 K rec/s | 261 K rec/s | **2.4×** |
-| 32 | 1.34 M rec/s | 241 K rec/s | **5.6×** |
-| 128 | 2.26 M rec/s | 245 K rec/s | **9.2×** |
-| 1024 | **2.53 M rec/s** | 252 K rec/s | **10.0×** |
+| 1 | 267 K rec/s | 273 K rec/s | 1.0× |
+| 8 | 1.14 M rec/s | 276 K rec/s | **4.1×** |
+| 32 | 1.61 M rec/s | 281 K rec/s | **5.7×** |
+| 128 | 2.92 M rec/s | 286 K rec/s | **10.2×** |
+| 1024 | **3.66 M rec/s** | 274 K rec/s | **13.3×** |
 
-The single-`send` floor of ~250 K rec/s is the mpsc actor round-trip (~4 µs per record); batching saves `(N − 1)` of those round-trips and lowers to one `Log::append_batch` call. The curve flattens by N = 128 and is fully amortized by N = 1024.
+The single-`send` floor of ~275 K rec/s is the mpsc actor round-trip (~3.6 µs per record); batching saves `(N − 1)` of those round-trips and lowers to one `Log::append_batch` call. The curve flattens by N = 128 and is fully amortized by N = 1024.
 
 #### `send_batch` with compression (256 B all-zero values)
 
 | Compression | N = 1 | N = 128 | N = 1024 |
 |---|---:|---:|---:|
-| None | 273 K | 2.26 M | 2.53 M |
-| **Lz4** | 254 K | 2.46 M | **3.34 M** |
-| Zstd | 240 K | 1.02 M | 1.13 M |
+| None | 267 K | 2.92 M | 3.66 M |
+| **Lz4** | 286 K | 3.01 M | **4.05 M** |
+| Zstd | 241 K | 1.06 M | 1.15 M |
 
-**Lz4 is faster than None at large batches** because the all-zero payload compresses ~96 %, so the writer task spends proportionally less time on disk I/O. With genuinely random / incompressible data, expect Lz4 to track None within ±10 %.
+**Lz4 is faster than None at large batches** because the all-zero payload compresses ~96 %, so the writer task spends proportionally less time on disk I/O. With genuinely random / incompressible data, expect Lz4 to track None within ±10 %. The per-record LZ4 hash-table allocation that hurt v0.1.1's memory profile is gone in v0.2.0 — see [Codec allocation profile](#codec-allocation-profile-v020) below.
 
-Reproduce: `cargo bench -p kafko --bench send_batch -- --baseline v0_1_1` (compares against the pinned v0.1.1 baseline under `target/criterion/`).
+Reproduce: `cargo bench -p kafko --bench send_batch --features compression-all -- --baseline v0_2_0` (compares against the pinned v0.2.0 baseline under `target/criterion/`; pass `--baseline v0_1_1` to compare against the v0.1.1 baseline preserved in the same tree).
 
-### Codec note — LZ4 per-call allocation
+### Codec allocation profile (v0.2.0)
 
-LZ4 (`Compression::Lz4`) allocates a fresh **8 KiB hash table on every record encode** (16 KiB on records larger than 64 KiB). This is a property of [`lz4_flex` 0.11](https://crates.io/crates/lz4_flex), kafko's LZ4 dependency: the public block-compress API does not expose a way to reuse the internal hash table across calls. In the in-process bench above, **~1.2 GB of the 1.3 GB total heap traffic** comes from this single source.
+Both LZ4 and Zstd are alloc-free on the write hot path after thread warm-up.
 
-The allocations are short-lived (freed immediately after each call) and don't visibly hurt throughput — LZ4 is still the rec/s leader at small records. But for memory-constrained or allocator-sensitive deployments, **zstd is the allocation-free codec on the write path**: `zstd::bulk::Compressor` is held in a thread-local and reuses its internal state across calls, so zstd's per-record heap footprint is essentially zero.
+- **LZ4** (`Compression::Lz4`) — kafko parks a per-thread `CompressTable`
+  in `compression.rs` and routes encodes through `lz4_flex 0.13`'s
+  `compress_into_with_table`, which clears the caller-owned hash table in
+  place instead of allocating a fresh one per call. Cost: **one 8 KiB
+  allocation per encoder thread for the process lifetime**, not per record.
+- **Zstd** (`Compression::Zstd`) — `zstd::bulk::Compressor` is held in a
+  thread-local and reuses its internal state across calls.
 
-This is fixable only at the dependency level — either when `lz4_flex` exposes a stateful block-compressor API, or by vendoring a slim equivalent into kafko.
+Measured in the kafko-bench `lz4_sequential` scenario (100 000 LZ4 sends,
+256 B records, in-process): `compression::compress` allocates **24.9 KiB
+total** across the run — three thread-local hash tables, one per worker
+thread that touched the LZ4 path. That's **0.10 % of total process
+allocation** under the same workload that previously attributed ~93 % of
+heap traffic to this single function on v0.1.1's `lz4_flex 0.11`.
+
+Throughput-wise, LZ4 sequential now tracks no-codec sequential within ~3 %
+(164 K vs 160 K rec/s in the same hotpath-instrumented harness) — LZ4 is no
+longer detectably more expensive than `None` on small-record workloads.
+
+Reproduce: `.\scripts\kafko_hotpath_matrix.ps1` and read the resulting
+`scripts\tmp\hotpath_<ts>\lz4_sequential.txt` (the `compression::compress`
+row of the `alloc-bytes` table is the headline).
 
 ## Performance recipes — pick once, ship it
 
@@ -256,11 +303,11 @@ All throughput numbers are 256 B records, single producer, in-process. Larger re
 
 | Goal | API | Compression | `LogConfig` | Expected throughput | Per-record latency |
 |---|---|---|---|---|---|
-| **Max throughput, compressible payloads** | `send_batch(N≥128)` | `Lz4` | `default()` | **~3.3 M rec/s** | amortized over batch |
-| **Max throughput, incompressible payloads** | `send_batch(N≥128)` | `None` | `default()` | **~2.5 M rec/s** | amortized over batch |
-| **Disk-efficient (best compression ratio)** | `send_batch(N≥32)` | `Zstd` | `default()` | ~1 M rec/s | amortized over batch |
-| **Lowest single-record latency** | `send()` | `None` | `default()` | ~250 K rec/s | **~4 µs / send** |
-| **Many concurrent producers, no batch API** | `send()` × N tasks | `None` or `Lz4` | bump `batch_max_bytes` to 1 MiB | scales with concurrency until disk caps | ~4 µs / send |
+| **Max throughput, compressible payloads** | `send_batch(N≥128)` | `Lz4` | `default()` | **~4.0 M rec/s** | amortized over batch |
+| **Max throughput, incompressible payloads** | `send_batch(N≥128)` | `None` | `default()` | **~3.7 M rec/s** | amortized over batch |
+| **Disk-efficient (best compression ratio)** | `send_batch(N≥32)` | `Zstd` | `default()` | ~1.1 M rec/s | amortized over batch |
+| **Lowest single-record latency** | `send()` | `None` | `default()` | ~275 K rec/s | **~3.6 µs / send** |
+| **Many concurrent producers, no batch API** | `send()` × N tasks | `None` or `Lz4` | bump `batch_max_bytes` to 1 MiB | scales with concurrency until disk caps | ~3.6 µs / send |
 
 ### Recipe 1 — Max throughput (compressible data)
 
@@ -285,11 +332,13 @@ let batch: Vec<(Option<Bytes>, Bytes)> = (0..1024)
 let offsets = producer.send_batch(batch).await?;
 ```
 
-Expect **~3.3 M rec/s** for redundant / structured payloads (e.g., JSON, logs, protobuf with shared schemas). Lz4 is genuinely free here — the disk-I/O saved more than pays for the compression CPU.
+Expect **~4.0 M rec/s** for redundant / structured payloads (e.g., JSON, logs, protobuf with shared schemas). Lz4 is genuinely free here — the disk-I/O saved more than pays for the compression CPU, and the per-call hash-table allocation that hurt v0.1.1's memory profile is gone in v0.2.0.
 
 ### Recipe 2 — Max throughput (incompressible data)
 
-Same shape, but pick `Compression::None` (or `Lz4` — it tracks None within ±10 % when data won't compress, but with the per-call LZ4 hash-table allocation overhead, `None` is preferable):
+Same shape, but pick `Compression::None` (or `Lz4` — it tracks `None` within
+~3 % on incompressible data now that the per-call hash-table alloc is gone, so
+either choice is fine):
 
 ```rust
 broker
@@ -301,7 +350,7 @@ broker
 // ...same send_batch(N≥128) loop as Recipe 1
 ```
 
-Expect **~2.5 M rec/s** for already-compressed payloads (encrypted blobs, JPEG/MP4 frames, random IDs).
+Expect **~3.7 M rec/s** for already-compressed payloads (encrypted blobs, JPEG/MP4 frames, random IDs).
 
 ### Recipe 3 — Lowest single-record latency
 
@@ -312,7 +361,7 @@ let producer = broker.producer_for("events").await?;
 let offset = producer.send(None, Bytes::from("one event")).await?;
 ```
 
-Floor: ~**4 µs per send** (mpsc → writer-task → fsync-to-page-cache → reply), ~250 K rec/s per producer. **Compression doesn't help here** — at this latency scale the codec cost dominates over disk savings.
+Floor: ~**3.6 µs per send** (mpsc → writer-task → write-to-page-cache → reply), ~275 K rec/s per producer. **Compression doesn't help here** — at this latency scale the codec cost dominates over disk savings.
 
 ### Recipe 4 — Many concurrent producers
 
@@ -345,7 +394,7 @@ The `config_sweep` bench data settled these — don't waste time on:
 - **`index_interval`** — the default 4 KiB is the sweet spot. Smaller (≤ 1 KiB) measurably hurts because of constant index writes; larger (≥ 32 KiB) doesn't help.
 - **`segment_size_threshold` below 1 MiB** — the `small_footprint` preset in `config_sweep` is **32 % slower** than default because rotation pressure dominates. Only worth it if you're disk-constrained AND read-heavy on cold data.
 
-## v0.1 — what's in
+## What's in (v0.2.0)
 
 - Single partition per topic
 - Single consumer per topic
@@ -353,18 +402,30 @@ The `config_sweep` bench data settled these — don't waste time on:
 - Crash recovery on startup (torn-tail truncate, sparse index rebuild)
 - Time- and size-based retention
 - Producer + Consumer async API on `tokio`
-- Per-topic compression (none / lz4 / zstd)
-- `Producer::send_batch` for atomic, single-round-trip batched appends (v0.1.1)
-- `kafko-http` — a separate workspace crate (`crates/kafko-http/`) exposing the broker over HTTP for integration testing and benchmarking
+- Per-topic compression (none / lz4 / zstd) — codecs are opt-in via Cargo
+  features (`compression-lz4`, `compression-zstd`, `compression-all`); default
+  build has zero compression dependencies
+- LZ4 hot-path allocation amortized to one 8 KiB workspace per encoder thread
+  via lz4_flex 0.13's `compress_into_with_table` (down from one alloc per record)
+- `Producer::send_batch` for atomic, single-round-trip batched appends
+- Data-directory lockfile — concurrent `Kafko::open` on the same dir fails fast
+- Writer-task panic recovery — typed `KafkoError::PartitionPanicked`
+- Graceful shutdown via explicit `shutdown().await` or `Drop` fallback
+- `kafko-http` — a separate workspace crate (`crates/kafko-http/`) exposing
+  the broker over HTTP for integration testing and benchmarking
 
-## v0.2 — roadmap
+## Roadmap
 
 - Multi-partition with key-based routing
 - Consumer groups with independent committed offsets
 - Log compaction (key-based dedup)
 - Configurable fsync policy (`EveryRecord` / `EveryBatch` / `EveryNms` / `Never`)
 - Headers / record metadata
-- Per-topic config persistence (currently a topic's compression is set at creation but not persisted across restarts)
+- Per-topic config persistence (currently a topic's compression is set at
+  creation but not persisted across restarts)
+- Buffered WAL via `BufWriter` (design parked in `docs/design-bufwriter.md`;
+  amortizes the per-record `write()` syscall, expected ~40 % sequential
+  throughput win)
 
 ## Not on the roadmap
 

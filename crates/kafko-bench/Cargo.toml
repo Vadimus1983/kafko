@@ -1,6 +1,6 @@
 [package]
 name = "kafko-bench"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 description = "In-process kafko bench harness; profiles kafko storage without HTTP/axum overhead in the flame graph."
@@ -21,3 +21,11 @@ hotpath        = ["dep:hotpath", "hotpath/hotpath", "kafko/hotpath"]
 hotpath-cpu    = ["hotpath", "hotpath/hotpath-cpu"]
 hotpath-alloc  = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-mcp    = ["hotpath", "hotpath/hotpath-mcp"]
+
+# Pass-throughs for kafko's compression codecs. kafko-bench's source also
+# uses `#[cfg(feature = "compression-lz4")]` to gate the lz4_sequential and
+# zstd_sequential scenarios, so `compression-all` here must activate both
+# sub-features (not only kafko's umbrella).
+compression-lz4  = ["kafko/compression-lz4"]
+compression-zstd = ["kafko/compression-zstd"]
+compression-all  = ["compression-lz4", "compression-zstd"]

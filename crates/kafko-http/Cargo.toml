@@ -1,12 +1,22 @@
 [package]
 name = "kafko-http"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 description = "HTTP test harness for kafko: single-partition, three-codec topology behind axum."
 
 [dependencies]
-kafko = { path = "../kafko" }
+kafko = { path = "../kafko", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 axum = "0.7"
 anyhow = "1"
+
+[features]
+# Default to all codecs because this binary's reason for existing is the
+# /produce/none vs /produce/lz4 vs /produce/zstd codec comparator. Users who
+# want a slimmer build can disable default features and opt in to specific
+# codecs individually.
+default          = ["compression-all"]
+compression-lz4  = ["kafko/compression-lz4"]
+compression-zstd = ["kafko/compression-zstd"]
+compression-all  = ["kafko/compression-all"]

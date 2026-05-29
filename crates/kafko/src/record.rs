@@ -71,23 +71,27 @@ impl Record {
     /// Equivalent to `encode_with(out, Compression::None)`. Consumes `self`
     /// to enforce single-use. Returns the on-wire byte count appended to `out`.
     pub fn encode(self, out: &mut BytesMut) -> usize {
-        self.encode_with(out, Compression::None)
+        // Compression::None never errors; bypass the Result path entirely.
+        self.encode_inner(out, Compression::None, None)
     }
 
     /// Consumes `self` to enforce single-use. Compresses the value if `compression` is non-`None`.
     /// Returns the actual on-wire byte count appended to `out`.
+    ///
+    /// Returns [`KafkoError::CompressionUnavailable`] when `compression` names a
+    /// codec whose Cargo feature is not enabled in this build of kafko.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub fn encode_with(self, out: &mut BytesMut, compression: Compression) -> usize {
+    pub fn encode_with(self, out: &mut BytesMut, compression: Compression) -> Result<usize> {
         // The Compression::None branch is zero-copy: encode_inner reads val bytes straight
         // from self.value. The compressed branches route the value through the per-thread
         // scratch buffer so encode_inner sees an already-compressed &[u8] without ever
         // materializing a fresh Vec<u8> on the hot path.
         match compression {
-            Compression::None => self.encode_inner(out, compression, None),
+            Compression::None => Ok(self.encode_inner(out, compression, None)),
             Compression::Lz4 | Compression::Zstd => ENCODE_COMPRESS_SCRATCH.with(|s| {
                 let mut scratch = s.borrow_mut();
-                compression.compress(&self.value, &mut scratch);
-                self.encode_inner(out, compression, Some(&scratch[..]))
+                compression.compress(&self.value, &mut scratch)?;
+                Ok(self.encode_inner(out, compression, Some(&scratch[..])))
             }),
         }
     }
@@ -332,6 +336,7 @@ mod tests {
         assert_eq!(buf.len(), 25 + 3 + 5);
     }
 
+    #[cfg(feature = "compression-lz4")]
     #[test]
     fn lz4_compression_roundtrip() {
         // A highly compressible value (lots of repeats) should round-trip identically.
@@ -339,7 +344,7 @@ mod tests {
         let r = Record::new(1_700_000_000_000, Some(Bytes::from_static(b"k")), payload.clone());
 
         let mut buf = BytesMut::new();
-        let actual_size = r.encode_with(&mut buf, Compression::Lz4);
+        let actual_size = r.encode_with(&mut buf, Compression::Lz4).unwrap();
 
         // Compressed size should be much smaller than uncompressed
         assert!(
@@ -354,13 +359,14 @@ mod tests {
         assert!(slice.is_empty());
     }
 
+    #[cfg(feature = "compression-zstd")]
     #[test]
     fn zstd_compression_roundtrip() {
         let payload = Bytes::from(vec![0xABu8; 1024]);
         let r = Record::new(1_700_000_000_000, Some(Bytes::from_static(b"k")), payload.clone());
 
         let mut buf = BytesMut::new();
-        let actual_size = r.encode_with(&mut buf, Compression::Zstd);
+        let actual_size = r.encode_with(&mut buf, Compression::Zstd).unwrap();
 
         assert!(
             actual_size < 1024,
@@ -374,6 +380,7 @@ mod tests {
         assert!(slice.is_empty());
     }
 
+    #[cfg(feature = "compression-lz4")]
     #[test]
     fn lz4_record_decodes_without_caller_knowing_compression() {
         // Decode is compression-agnostic — it reads the flag from the wire.
@@ -381,13 +388,14 @@ mod tests {
         let r = Record::new(42, None, payload.clone());
 
         let mut buf = BytesMut::new();
-        r.encode_with(&mut buf, Compression::Lz4);
+        r.encode_with(&mut buf, Compression::Lz4).unwrap();
 
         let mut slice: &[u8] = &buf;
         let decoded = Record::decode(&mut slice).unwrap();
         assert_eq!(decoded.value(), &payload);
     }
 
+    #[cfg(feature = "compression-lz4")]
     #[test]
     fn decode_rejects_lz4_record_with_oversized_decompressed_size_claim() {
         // End-to-end fuzz regression: a CRC-valid record whose LZ4 value bytes
@@ -417,6 +425,38 @@ mod tests {
         match Record::decode(&mut slice) {
             Err(KafkoError::DecompressionFailed) => {}
             other => panic!("expected DecompressionFailed, got {:?}", other),
+        }
+    }
+
+    #[cfg(not(feature = "compression-lz4"))]
+    #[test]
+    fn decode_lz4_record_in_build_without_lz4_returns_compression_unavailable() {
+        // A reader built without the `compression-lz4` feature must surface a
+        // friendly CompressionUnavailable error when it encounters a record
+        // written with LZ4 by another build, rather than mis-decoding the bytes.
+        const KEY_NULL_SENTINEL_LOCAL: u32 = u32::MAX;
+        let payload_bytes: [u8; 4] = [0, 0, 0, 0];
+
+        let payload_field_len = 1 + 8 + 4 + (4 + payload_bytes.len());
+        let total_len = 4 + payload_field_len;
+
+        let mut wire = Vec::with_capacity(4 + total_len);
+        wire.extend_from_slice(&(total_len as u32).to_be_bytes());
+        let crc_pos = wire.len();
+        wire.extend_from_slice(&[0u8; 4]);
+        let payload_start = wire.len();
+        wire.push(Compression::Lz4.flag());
+        wire.extend_from_slice(&0i64.to_be_bytes());
+        wire.extend_from_slice(&KEY_NULL_SENTINEL_LOCAL.to_be_bytes());
+        wire.extend_from_slice(&(payload_bytes.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&payload_bytes);
+        let crc = crc32fast::hash(&wire[payload_start..]);
+        wire[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_be_bytes());
+
+        let mut slice: &[u8] = &wire;
+        match Record::decode(&mut slice) {
+            Err(KafkoError::CompressionUnavailable(Compression::Lz4)) => {}
+            other => panic!("expected CompressionUnavailable(Lz4), got {:?}", other),
         }
     }
 }

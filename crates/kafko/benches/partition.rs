@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use kafko::{Compression, Consumer, LogConfig, Partition, Producer, Record};
+#[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
+use kafko::Compression;
+use kafko::{Consumer, LogConfig, Partition, Producer, Record};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Runtime};
@@ -69,7 +71,8 @@ fn bench_append_single(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_append_single_lz4(c: &mut Criterion) {
+#[cfg(feature = "compression-lz4")]
+fn bench_append_single_lz4_inner(c: &mut Criterion) {
     let rt = make_runtime();
     let mut group = c.benchmark_group("partition_append_single_lz4");
 
@@ -105,7 +108,15 @@ fn bench_append_single_lz4(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_append_single_zstd(c: &mut Criterion) {
+fn bench_append_single_lz4(c: &mut Criterion) {
+    #[cfg(feature = "compression-lz4")]
+    bench_append_single_lz4_inner(c);
+    #[cfg(not(feature = "compression-lz4"))]
+    let _ = c;
+}
+
+#[cfg(feature = "compression-zstd")]
+fn bench_append_single_zstd_inner(c: &mut Criterion) {
     let rt = make_runtime();
     let mut group = c.benchmark_group("partition_append_single_zstd");
 
@@ -139,6 +150,13 @@ fn bench_append_single_zstd(c: &mut Criterion) {
     }
 
     group.finish();
+}
+
+fn bench_append_single_zstd(c: &mut Criterion) {
+    #[cfg(feature = "compression-zstd")]
+    bench_append_single_zstd_inner(c);
+    #[cfg(not(feature = "compression-zstd"))]
+    let _ = c;
 }
 
 fn bench_append_concurrent(c: &mut Criterion) {

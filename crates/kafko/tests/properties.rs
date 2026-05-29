@@ -13,11 +13,15 @@ fn run_async<F: Future>(f: F) -> F::Output {
 }
 
 fn any_compression() -> impl Strategy<Value = Compression> {
-    prop_oneof![
-        Just(Compression::None),
-        Just(Compression::Lz4),
-        Just(Compression::Zstd),
-    ]
+    // Only include codecs whose Cargo feature is enabled — encoding under a
+    // disabled codec would (correctly) fail with CompressionUnavailable.
+    #[allow(unused_mut)]
+    let mut strategies: Vec<BoxedStrategy<Compression>> = vec![Just(Compression::None).boxed()];
+    #[cfg(feature = "compression-lz4")]
+    strategies.push(Just(Compression::Lz4).boxed());
+    #[cfg(feature = "compression-zstd")]
+    strategies.push(Just(Compression::Zstd).boxed());
+    proptest::strategy::Union::new(strategies)
 }
 
 proptest! {
@@ -63,7 +67,9 @@ proptest! {
         let expected = record.clone();
 
         let mut buf = BytesMut::new();
-        let on_wire = record.encode_with(&mut buf, compression);
+        let on_wire = record
+            .encode_with(&mut buf, compression)
+            .expect("encode_with must succeed for any enabled codec");
         prop_assert_eq!(buf.len(), on_wire);
 
         let mut slice: &[u8] = &buf;
