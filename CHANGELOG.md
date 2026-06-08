@@ -4,7 +4,15 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.3.0] — 2026-06-08
+
+Multi-partition topics with key-based routing. A topic can now own N partitions,
+each with its own writer task and log, so producers write in parallel. Records
+route by key (`hash(key) % partitions`) so same-key records keep their order;
+keyless records spread round-robin. A single consumer reads all partitions merged
+into one stream. Ordering is guaranteed **within** a partition; cross-partition
+order is intentionally undefined — the standard Kafka contract. Default partition
+count is 1, so single-partition topics behave as before.
 
 ### Added
 
@@ -20,19 +28,6 @@ adheres to [Semantic Versioning](https://semver.org/).
   `commit()` is a no-op). New error `KafkoError::InvalidGroupName`.
   Single active consumer per group for now; multi-member partition assignment +
   rebalancing is a later slice.
-
-## [0.3.0] — 2026-06-07
-
-Multi-partition topics with key-based routing. A topic can now own N partitions,
-each with its own writer task and log, so producers write in parallel. Records
-route by key (`hash(key) % partitions`) so same-key records keep their order;
-keyless records spread round-robin. A single consumer reads all partitions merged
-into one stream. Ordering is guaranteed **within** a partition; cross-partition
-order is intentionally undefined — the standard Kafka contract. Default partition
-count is 1, so single-partition topics behave as before.
-
-### Added
-
 - `Kafko::create_topic_with_partitions(name, count)` and
   `create_topic_with_config_and_partitions(name, cfg, count)` — create a topic
   with `count` partitions. `count == 0` returns `KafkoError::InvalidPartitionCount`.

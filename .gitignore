@@ -7,3 +7,7 @@
 scripts/tmp/
 /fuzz/Cargo.lock
 /kafko-bench_data
+
+# Local-only: agent guidance (personal context) + MCP server config
+CLAUDE.md
+.mcp.json
