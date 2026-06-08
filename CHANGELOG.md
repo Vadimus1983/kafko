@@ -4,6 +4,72 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Resumable consumers via committed offsets (consumer groups, part 1).**
+  `Kafko::consumer_for_group(topic, group)` returns a consumer that resumes from
+  the group's durably committed position instead of offset 0 — the
+  "continue where it stopped after a restart" behaviour. `Consumer::commit()`
+  persists the current per-partition read position (atomic temp + fsync + rename
+  to `<topic>/offsets/<group>`, CRC-framed); `Consumer::committed(partition)` and
+  `Consumer::group()` introspect. Distinct groups on a topic keep independent
+  positions (durable pub/sub fan-out). A torn/corrupt offset file degrades to
+  "start from 0", never an error. `consumer_for` stays anonymous (reads from 0;
+  `commit()` is a no-op). New error `KafkoError::InvalidGroupName`.
+  Single active consumer per group for now; multi-member partition assignment +
+  rebalancing is a later slice.
+
+## [0.3.0] — 2026-06-07
+
+Multi-partition topics with key-based routing. A topic can now own N partitions,
+each with its own writer task and log, so producers write in parallel. Records
+route by key (`hash(key) % partitions`) so same-key records keep their order;
+keyless records spread round-robin. A single consumer reads all partitions merged
+into one stream. Ordering is guaranteed **within** a partition; cross-partition
+order is intentionally undefined — the standard Kafka contract. Default partition
+count is 1, so single-partition topics behave as before.
+
+### Added
+
+- `Kafko::create_topic_with_partitions(name, count)` and
+  `create_topic_with_config_and_partitions(name, cfg, count)` — create a topic
+  with `count` partitions. `count == 0` returns `KafkoError::InvalidPartitionCount`.
+- `Kafko::partition_count(name) -> Option<u32>`.
+- `Topic` — public type owning a topic's partitions and its routing (FNV-1a key
+  hash + round-robin). Obtained via `Kafko::topic`.
+- `RecordPosition { partition, offset }` — returned by all `Producer` send
+  methods.
+- `Producer::send_to(partition, key, value)` for explicit partition targeting,
+  and `Producer::partition_count()`.
+- `Consumer::next_with_position()` (record + its `RecordPosition`),
+  `from_topic`/`from_topic_at`, `seek_all(offset)`, `seek(partition, offset)`,
+  `position(partition)`, `partition_count()`.
+
+### Changed (breaking)
+
+- **`Producer::send` / `send_record` now return `RecordPosition`** instead of a
+  bare `u64` offset (an offset is only meaningful within a partition). `send_batch`
+  / `send_batch_records` return `Vec<RecordPosition>`. Read `.offset()` /
+  `.partition()` on the result.
+- **`send_batch` atomicity is now per-partition.** A batch whose records route to
+  different partitions is atomic within each partition, not across them. For a
+  single-partition topic this is unchanged (one fully-atomic append).
+- **On-disk layout changed** to `<dir>/<topic>/<partition>/<segments>`. Data
+  directories written by kafko <= 0.2 (segments directly under the topic dir) will
+  not open — `Kafko::open` returns `KafkoError::InvalidTopicLayout`. There is no
+  automatic migration.
+- **`Kafko::topic` returns `Arc<Topic>`** (was `Arc<Partition>`).
+- `Producer::new` takes `Arc<Topic>`; `Consumer` is built from a `Topic`
+  (`from_topic` / `from_topic_at`) and `Consumer::seek` now takes a partition
+  index (use `seek_all` for the old whole-stream behaviour).
+
+### Internal
+
+- Each topic shares one `tokio::sync::Notify` across its partitions; a merged
+  consumer parks on it and wakes on any partition's progress. No new dependency.
+
 ## [0.2.0] — 2026-05-29
 
 ### Performance

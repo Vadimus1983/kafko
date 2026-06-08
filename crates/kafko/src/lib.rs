@@ -21,21 +21,21 @@
 //!
 //!     // Produce one record
 //!     let producer = broker.producer_for("orders").await?;
-//!     let offset = producer.send(None, Bytes::from("order-1")).await?;
-//!     println!("appended at offset {offset}");
+//!     let pos = producer.send(None, Bytes::from("order-1")).await?;
+//!     println!("appended at partition {} offset {}", pos.partition(), pos.offset());
 //!
 //!     // Produce many records atomically in one round-trip
-//!     let offsets = producer
+//!     let positions = producer
 //!         .send_batch(vec![
 //!             (None, Bytes::from("order-2")),
 //!             (None, Bytes::from("order-3")),
 //!         ])
 //!         .await?;
-//!     println!("batch offsets: {:?}", offsets);
+//!     println!("batch positions: {:?}", positions);
 //!
 //!     // Consume from the beginning
 //!     let mut consumer = broker.consumer_for("orders").await?;
-//!     consumer.seek(0);
+//!     consumer.seek_all(0);
 //!     let record = consumer.next_record().await?;
 //!     println!("read: {:?}", record.value());
 //!
@@ -63,11 +63,14 @@ mod compression;
 mod consumer;
 mod error;
 mod log;
+mod offset_store;
 mod partition;
+mod position;
 mod producer;
 mod record;
 mod segment;
 mod sparse_index;
+mod topic;
 
 pub use broker::Kafko;
 pub use compression::Compression;
@@ -75,10 +78,12 @@ pub use consumer::Consumer;
 pub use error::{KafkoError, Result};
 pub use log::{Log, LogConfig};
 pub use partition::Partition;
+pub use position::RecordPosition;
 pub use producer::Producer;
 pub use record::Record;
 pub use segment::Segment;
 pub use sparse_index::SparseIndex;
+pub use topic::Topic;
 
 
 

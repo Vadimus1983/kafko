@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use kafko::{Consumer, LogConfig, Partition, Producer, Record};
+use kafko::{Consumer, LogConfig, Producer, Record, Topic};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -12,22 +12,26 @@ fn make_record(marker: u64) -> Record {
     )
 }
 
+async fn single_partition_topic(dir: &TempDir) -> Arc<Topic> {
+    Arc::new(
+        Topic::create(dir.path(), "t", 1, LogConfig::default())
+            .await
+            .unwrap(),
+    )
+}
+
 #[tokio::test]
 async fn consumer_reads_back_existing_records() {
     let dir = TempDir::new().unwrap();
-    let partition = Arc::new(
-        Partition::open(dir.path(), LogConfig::default())
-            .await
-            .unwrap(),
-    );
-    let producer = Producer::new(partition.clone());
+    let topic = single_partition_topic(&dir).await;
+    let producer = Producer::new(topic.clone());
 
     let records: Vec<Record> = (0..3).map(make_record).collect();
     for r in &records {
         producer.send_record(r.clone()).await.unwrap();
     }
 
-    let mut consumer = Consumer::from_partition(partition.clone());
+    let mut consumer = Consumer::from_topic(topic.clone());
     for expected in records {
         let actual = consumer.next_record().await.unwrap();
         assert_eq!(actual, expected);
@@ -37,37 +41,29 @@ async fn consumer_reads_back_existing_records() {
 #[tokio::test]
 async fn consumer_position_advances_after_each_read() {
     let dir = TempDir::new().unwrap();
-    let partition = Arc::new(
-        Partition::open(dir.path(), LogConfig::default())
-            .await
-            .unwrap(),
-    );
-    let producer = Producer::new(partition.clone());
+    let topic = single_partition_topic(&dir).await;
+    let producer = Producer::new(topic.clone());
 
     producer.send_record(make_record(0)).await.unwrap();
     producer.send_record(make_record(1)).await.unwrap();
 
-    let mut consumer = Consumer::from_partition(partition.clone());
-    assert_eq!(consumer.position(), 0);
+    let mut consumer = Consumer::from_topic(topic.clone());
+    assert_eq!(consumer.position(0), 0);
     consumer.next_record().await.unwrap();
-    assert_eq!(consumer.position(), 1);
+    assert_eq!(consumer.position(0), 1);
     consumer.next_record().await.unwrap();
-    assert_eq!(consumer.position(), 2);
+    assert_eq!(consumer.position(0), 2);
 }
 
 #[tokio::test]
 async fn consumer_wakes_up_when_record_appended() {
     let dir = TempDir::new().unwrap();
-    let partition = Arc::new(
-        Partition::open(dir.path(), LogConfig::default())
-            .await
-            .unwrap(),
-    );
-    let producer = Producer::new(partition.clone());
+    let topic = single_partition_topic(&dir).await;
+    let producer = Producer::new(topic.clone());
 
-    let consumer_partition = partition.clone();
+    let consumer_topic = topic.clone();
     let waiter = tokio::spawn(async move {
-        let mut consumer = Consumer::from_partition(consumer_partition);
+        let mut consumer = Consumer::from_topic(consumer_topic);
         consumer.next_record().await.unwrap()
     });
 
@@ -86,65 +82,53 @@ async fn consumer_wakes_up_when_record_appended() {
 #[tokio::test]
 async fn consumer_can_seek_to_offset() {
     let dir = TempDir::new().unwrap();
-    let partition = Arc::new(
-        Partition::open(dir.path(), LogConfig::default())
-            .await
-            .unwrap(),
-    );
-    let producer = Producer::new(partition.clone());
+    let topic = single_partition_topic(&dir).await;
+    let producer = Producer::new(topic.clone());
 
     for i in 0..5u64 {
         producer.send_record(make_record(i)).await.unwrap();
     }
 
-    let mut consumer = Consumer::from_partition(partition.clone());
-    consumer.seek(3);
+    let mut consumer = Consumer::from_topic(topic.clone());
+    consumer.seek_all(3);
     assert_eq!(consumer.next_record().await.unwrap(), make_record(3));
     assert_eq!(consumer.next_record().await.unwrap(), make_record(4));
-    assert_eq!(consumer.position(), 5);
+    assert_eq!(consumer.position(0), 5);
 }
 
 #[tokio::test]
 async fn multiple_consumers_have_independent_cursors() {
     let dir = TempDir::new().unwrap();
-    let partition = Arc::new(
-        Partition::open(dir.path(), LogConfig::default())
-            .await
-            .unwrap(),
-    );
-    let producer = Producer::new(partition.clone());
+    let topic = single_partition_topic(&dir).await;
+    let producer = Producer::new(topic.clone());
 
     for i in 0..5u64 {
         producer.send_record(make_record(i)).await.unwrap();
     }
 
-    let mut c1 = Consumer::from_partition(partition.clone());
-    let mut c2 = Consumer::from_partition_at(partition.clone(), 2);
+    let mut c1 = Consumer::from_topic(topic.clone());
+    let mut c2 = Consumer::from_topic_at(topic.clone(), 2);
 
     assert_eq!(c1.next_record().await.unwrap(), make_record(0));
     assert_eq!(c2.next_record().await.unwrap(), make_record(2));
     assert_eq!(c1.next_record().await.unwrap(), make_record(1));
     assert_eq!(c2.next_record().await.unwrap(), make_record(3));
 
-    assert_eq!(c1.position(), 2);
-    assert_eq!(c2.position(), 4);
+    assert_eq!(c1.position(0), 2);
+    assert_eq!(c2.position(0), 4);
 }
 
 #[tokio::test]
 async fn consumer_at_start_offset_skips_earlier_records() {
     let dir = TempDir::new().unwrap();
-    let partition = Arc::new(
-        Partition::open(dir.path(), LogConfig::default())
-            .await
-            .unwrap(),
-    );
-    let producer = Producer::new(partition.clone());
+    let topic = single_partition_topic(&dir).await;
+    let producer = Producer::new(topic.clone());
 
     for i in 0..5u64 {
         producer.send_record(make_record(i)).await.unwrap();
     }
 
-    let mut consumer = Consumer::from_partition_at(partition.clone(), 3);
+    let mut consumer = Consumer::from_topic_at(topic.clone(), 3);
     assert_eq!(consumer.next_record().await.unwrap(), make_record(3));
     assert_eq!(consumer.next_record().await.unwrap(), make_record(4));
 }
@@ -152,16 +136,12 @@ async fn consumer_at_start_offset_skips_earlier_records() {
 #[tokio::test]
 async fn producer_consumer_handshake_across_tasks() {
     let dir = TempDir::new().unwrap();
-    let partition = Arc::new(
-        Partition::open(dir.path(), LogConfig::default())
-            .await
-            .unwrap(),
-    );
-    let producer = Producer::new(partition.clone());
+    let topic = single_partition_topic(&dir).await;
+    let producer = Producer::new(topic.clone());
 
-    let consumer_partition = partition.clone();
+    let consumer_topic = topic.clone();
     let consumer_task = tokio::spawn(async move {
-        let mut consumer = Consumer::from_partition(consumer_partition);
+        let mut consumer = Consumer::from_topic(consumer_topic);
         let mut received = Vec::new();
         for _ in 0..5 {
             received.push(consumer.next_record().await.unwrap());

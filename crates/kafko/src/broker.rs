@@ -1,8 +1,9 @@
 use crate::consumer::Consumer;
 use crate::error::{KafkoError, Result};
 use crate::log::LogConfig;
-use crate::partition::Partition;
+use crate::offset_store::OffsetStore;
 use crate::producer::Producer;
+use crate::topic::Topic;
 use fs4::fs_std::FileExt;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -31,7 +32,7 @@ pub struct Kafko {
     // std::sync::RwLock (not tokio::sync) so Drop can `get_mut()` the registry
     // synchronously. Touched only on admin / handle-binding paths, never on the
     // record hot path; there is no perf cost to blocking-locks here.
-    topics: RwLock<HashMap<String, Arc<Partition>>>,
+    topics: RwLock<HashMap<String, Arc<Topic>>>,
     default_log_config: LogConfig,
     // Held for the broker's lifetime. Dropping the File releases the OS-level
     // advisory lock so a future Kafko::open on the same dir can succeed.
@@ -60,8 +61,8 @@ impl Kafko {
     /// broker.create_topic("orders").await?;
     ///
     /// let producer = broker.producer_for("orders").await?;
-    /// let offset = producer.send(None, Bytes::from("order-1")).await?;
-    /// println!("appended at offset {offset}");
+    /// let pos = producer.send(None, Bytes::from("order-1")).await?;
+    /// println!("appended at partition {} offset {}", pos.partition(), pos.offset());
     ///
     /// broker.shutdown().await?;
     /// # Ok(())
@@ -95,8 +96,8 @@ impl Kafko {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let partition = Partition::open(&entry.path(), default_log_config).await?;
-            topics.insert(name, Arc::new(partition));
+            let topic = Topic::open(&entry.path(), &name, default_log_config).await?;
+            topics.insert(name, Arc::new(topic));
         }
 
         Ok(Self {
@@ -120,21 +121,52 @@ impl Kafko {
         &self.default_log_config
     }
 
-    /// Creates a new topic under the broker's data directory using the broker's
-    /// default [`LogConfig`]. Errors with [`KafkoError::TopicAlreadyExists`] if
-    /// the topic already exists.
+    /// Creates a new single-partition topic using the broker's default
+    /// [`LogConfig`]. Errors with [`KafkoError::TopicAlreadyExists`] if the topic
+    /// already exists.
     pub async fn create_topic(&self, name: &str) -> Result<()> {
-        self.create_topic_with_config(name, self.default_log_config)
+        self.create_topic_inner(name, self.default_log_config, 1)
             .await
     }
 
     /// Like [`create_topic`] but accepts an explicit [`LogConfig`] (compression,
-    /// segment size, retention) for the new topic.
+    /// segment size, retention). The topic has a single partition.
     ///
     /// [`create_topic`]: Kafko::create_topic
     pub async fn create_topic_with_config(&self, name: &str, log_config: LogConfig) -> Result<()> {
+        self.create_topic_inner(name, log_config, 1).await
+    }
+
+    /// Creates a topic with `partitions` partitions using the broker's default
+    /// [`LogConfig`]. Records routed by key (`hash(key) % partitions`) keep their
+    /// per-key order; keyless records spread round-robin. Errors with
+    /// [`KafkoError::InvalidPartitionCount`] if `partitions` is 0.
+    pub async fn create_topic_with_partitions(&self, name: &str, partitions: u32) -> Result<()> {
+        self.create_topic_inner(name, self.default_log_config, partitions)
+            .await
+    }
+
+    /// Creates a topic with both an explicit [`LogConfig`] and a partition count.
+    pub async fn create_topic_with_config_and_partitions(
+        &self,
+        name: &str,
+        log_config: LogConfig,
+        partitions: u32,
+    ) -> Result<()> {
+        self.create_topic_inner(name, log_config, partitions).await
+    }
+
+    async fn create_topic_inner(
+        &self,
+        name: &str,
+        log_config: LogConfig,
+        partitions: u32,
+    ) -> Result<()> {
+        if partitions == 0 {
+            return Err(KafkoError::InvalidPartitionCount(0));
+        }
         // Check existence + reserve under the write lock; release before the async
-        // Partition::open so we don't hold the lock across an .await.
+        // Topic::create so we don't hold the lock across an .await.
         {
             let topics = self.topics.read().expect("topics RwLock poisoned");
             if topics.contains_key(name) {
@@ -142,14 +174,14 @@ impl Kafko {
             }
         }
         let topic_dir = self.dir.join(name);
-        let partition = Partition::open(&topic_dir, log_config).await?;
+        let topic = Topic::create(&topic_dir, name, partitions, log_config).await?;
 
         let mut topics = self.topics.write().expect("topics RwLock poisoned");
         if topics.contains_key(name) {
             // Lost a race; another caller created the same topic in between.
             return Err(KafkoError::TopicAlreadyExists(name.to_string()));
         }
-        topics.insert(name.to_string(), Arc::new(partition));
+        topics.insert(name.to_string(), Arc::new(topic));
         Ok(())
     }
 
@@ -159,18 +191,18 @@ impl Kafko {
     /// handles for the topic still exist (the registry is restored on that
     /// path so the caller can drop those handles and retry).
     pub async fn delete_topic(&self, name: &str) -> Result<()> {
-        let partition = {
+        let topic = {
             let mut topics = self.topics.write().expect("topics RwLock poisoned");
             match topics.remove(name) {
-                Some(p) => p,
+                Some(t) => t,
                 None => return Err(KafkoError::TopicNotFound(name.to_string())),
             }
         };
 
-        match Arc::try_unwrap(partition) {
+        match Arc::try_unwrap(topic) {
             Ok(owned) => {
                 let topic_dir = self.dir.join(name);
-                owned.shutdown().await?;
+                owned.shutdown().await;
                 tokio::fs::remove_dir_all(&topic_dir).await?;
                 Ok(())
             }
@@ -206,14 +238,14 @@ impl Kafko {
             .contains_key(name)
     }
 
-    /// Returns a shared handle to the named topic's [`Partition`], or `None`
-    /// if no such topic exists. Most callers want [`producer_for`] /
-    /// [`consumer_for`] instead; this is for callers that need to observe the
-    /// partition's high-water-mark directly.
+    /// Returns a shared handle to the named [`Topic`], or `None` if no such topic
+    /// exists. Most callers want [`producer_for`] / [`consumer_for`] instead;
+    /// this is for callers that need to inspect partitions or high-water-marks
+    /// directly.
     ///
     /// [`producer_for`]: Kafko::producer_for
     /// [`consumer_for`]: Kafko::consumer_for
-    pub async fn topic(&self, name: &str) -> Option<Arc<Partition>> {
+    pub async fn topic(&self, name: &str) -> Option<Arc<Topic>> {
         self.topics
             .read()
             .expect("topics RwLock poisoned")
@@ -221,26 +253,60 @@ impl Kafko {
             .cloned()
     }
 
+    /// Returns the number of partitions on the named topic, or `None` if it
+    /// doesn't exist.
+    pub async fn partition_count(&self, name: &str) -> Option<u32> {
+        self.topics
+            .read()
+            .expect("topics RwLock poisoned")
+            .get(name)
+            .map(|t| t.partition_count())
+    }
+
     /// Returns a [`Producer`] bound to the named topic. Producers are cheap to
     /// clone and share. Errors with [`KafkoError::TopicNotFound`] if the topic
     /// doesn't exist.
     pub async fn producer_for(&self, name: &str) -> Result<Producer> {
-        let partition = self
+        let topic = self
             .topic(name)
             .await
             .ok_or_else(|| KafkoError::TopicNotFound(name.to_string()))?;
-        Ok(Producer::new(partition))
+        Ok(Producer::new(topic))
     }
 
-    /// Returns a [`Consumer`] positioned at offset 0 of the named topic. Call
-    /// [`Consumer::seek`] to start from a different offset. Errors with
-    /// [`KafkoError::TopicNotFound`] if the topic doesn't exist.
+    /// Returns a [`Consumer`] positioned at offset 0 of every partition of the
+    /// named topic. Call [`Consumer::seek_all`] / [`Consumer::seek`] to start
+    /// elsewhere. Errors with [`KafkoError::TopicNotFound`] if the topic doesn't
+    /// exist.
     pub async fn consumer_for(&self, name: &str) -> Result<Consumer> {
-        let partition = self
+        let topic = self
             .topic(name)
             .await
             .ok_or_else(|| KafkoError::TopicNotFound(name.to_string()))?;
-        Ok(Consumer::from_partition(partition))
+        Ok(Consumer::from_topic(topic))
+    }
+
+    /// Returns a [`Consumer`] bound to consumer group `group`, resuming from the
+    /// group's durably committed offsets (offset 0 per partition if the group has
+    /// never committed). Call [`Consumer::commit`] after processing to advance the
+    /// committed position so a future consumer in the same group picks up where
+    /// this one left off. Distinct groups on the same topic keep independent
+    /// positions.
+    ///
+    /// Errors with [`KafkoError::TopicNotFound`] if the topic doesn't exist, or
+    /// [`KafkoError::InvalidGroupName`] if `group` is empty or not `[A-Za-z0-9._-]`.
+    ///
+    /// Slice A scope: one active consumer per group. Sharing a group across
+    /// several live consumers (partition assignment + rebalancing) is a later
+    /// feature.
+    pub async fn consumer_for_group(&self, name: &str, group: &str) -> Result<Consumer> {
+        let topic = self
+            .topic(name)
+            .await
+            .ok_or_else(|| KafkoError::TopicNotFound(name.to_string()))?;
+        let offsets_dir = self.dir.join(name).join("offsets");
+        let store = OffsetStore::open(&offsets_dir, group, topic.partition_count()).await?;
+        Ok(Consumer::from_topic_with_group(topic, store))
     }
 
     /// Gracefully closes the broker. Every partition's writer task drains its
@@ -264,7 +330,7 @@ impl Kafko {
     /// flushed by the kernel may be lost.
     pub async fn shutdown(mut self) -> Result<()> {
         let topics = std::mem::take(self.topics.get_mut().expect("topics RwLock poisoned"));
-        shutdown_partitions(topics).await;
+        shutdown_topics(topics).await;
         // `Drop::drop` will run next on self, but `topics` is now empty so the
         // Drop impl is a no-op. `_dir_lock` drops at the end of Drop, releasing
         // the advisory lock.
@@ -307,7 +373,7 @@ impl Drop for Kafko {
             return;
         };
 
-        let cleanup = shutdown_partitions(topics);
+        let cleanup = shutdown_topics(topics);
 
         match handle.runtime_flavor() {
             tokio::runtime::RuntimeFlavor::CurrentThread => {
@@ -329,13 +395,13 @@ impl Drop for Kafko {
 }
 
 /// Shared cleanup helper: takes ownership of the topics map and drives each
-/// partition's `shutdown()` to completion. Partitions whose `Arc` still has
-/// external producer/consumer references are skipped (their writer tasks keep
-/// running until those handles also drop).
-async fn shutdown_partitions(topics: HashMap<String, Arc<Partition>>) {
-    for (_, partition) in topics {
-        if let Ok(owned) = Arc::try_unwrap(partition) {
-            let _ = owned.shutdown().await;
+/// topic's `shutdown()` to completion (which in turn shuts down its partitions).
+/// Topics whose `Arc` still has external producer/consumer references are skipped
+/// (their writer tasks keep running until those handles also drop).
+async fn shutdown_topics(topics: HashMap<String, Arc<Topic>>) {
+    for (_, topic) in topics {
+        if let Ok(owned) = Arc::try_unwrap(topic) {
+            owned.shutdown().await;
         }
     }
 }

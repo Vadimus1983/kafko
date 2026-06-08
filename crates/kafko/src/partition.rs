@@ -1,6 +1,7 @@
 use crate::error::{KafkoError, Result};
 use crate::log::{Log, LogConfig};
 use crate::record::Record;
+use crate::topic::Wakeup;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -58,12 +59,27 @@ impl Partition {
     ///
     /// [`Kafko`]: crate::Kafko
     pub async fn open(dir: &Path, config: LogConfig) -> Result<Self> {
+        Self::open_with_wake(dir, config, None).await
+    }
+
+    /// Like [`open`], but the writer task pulses `wake` after every high-water-mark
+    /// advance and once when it exits. A [`Topic`] shares one [`Wakeup`] across all
+    /// its partitions so a merged consumer can park on a single signal and wake on
+    /// activity from any partition.
+    ///
+    /// [`open`]: Partition::open
+    /// [`Topic`]: crate::Topic
+    pub(crate) async fn open_with_wake(
+        dir: &Path,
+        config: LogConfig,
+        wake: Option<Arc<Wakeup>>,
+    ) -> Result<Self> {
         let log = Log::open(dir, config).await?;
         let initial_hwm = log.next_offset();
         let (inbox_tx, inbox_rx) = mpsc::channel(INBOX_CAPACITY);
         let (hwm_tx, hwm_rx) = watch::channel(initial_hwm);
 
-        let writer_handle = tokio::spawn(partition_writer_loop(log, inbox_rx, hwm_tx));
+        let writer_handle = tokio::spawn(partition_writer_loop(log, inbox_rx, hwm_tx, wake));
 
         let panic_info = Arc::new(OnceLock::new());
         let (done_tx, writer_done_rx) = watch::channel(false);
@@ -289,6 +305,7 @@ async fn partition_writer_loop(
     mut log: Log,
     mut inbox: mpsc::Receiver<PartitionCommand>,
     hwm_tx: watch::Sender<u64>,
+    wake: Option<Arc<Wakeup>>,
 ) {
     let mut retention_tick = tokio::time::interval(log.config().retention_check_interval);
     retention_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -313,6 +330,12 @@ async fn partition_writer_loop(
                     batch_max_bytes,
                     &mut fail_next_kind,
                 ).await;
+                // Wake any consumer parked on the shared signal so it re-scans
+                // this partition. `signal()` is a relaxed atomic load when no
+                // consumer is parked, so this is ~free on the pure-producer path.
+                if let Some(w) = &wake {
+                    w.signal();
+                }
             }
             _ = retention_tick.tick() => {
                 let _ = log.apply_retention().await;
@@ -326,6 +349,12 @@ async fn partition_writer_loop(
     // it returns, every record this writer ever acked is fsynced. Errors here are
     // silently ignored — the task is unwinding and there is no caller to report to.
     let _ = log.sync().await;
+    // Final pulse: a consumer parked on the signal wakes, re-scans, and observes
+    // Closed from read_record_at now that the inbox is gone — so a merged consumer
+    // doesn't hang forever after shutdown.
+    if let Some(w) = &wake {
+        w.signal();
+    }
 }
 
 // When the first command of a wake-up is an Append, drain any other ready Appends

@@ -90,6 +90,28 @@ pub enum KafkoError {
         /// Panic payload as a string (recovered from `Any` downcasts).
         payload: String,
     },
+
+    /// A topic was requested with zero partitions. Topics need at least one.
+    #[error("invalid partition count {0}: a topic needs at least 1 partition")]
+    InvalidPartitionCount(u32),
+
+    /// A consumer-group name was empty, `.`/`..`, or contained characters outside
+    /// `[A-Za-z0-9._-]` (group names are used as on-disk filenames).
+    #[error("invalid consumer group name {0:?}: use non-empty [A-Za-z0-9._-]")]
+    InvalidGroupName(String),
+
+    /// A topic directory on disk does not have the expected
+    /// `<topic>/<partition-index>/` layout — no numeric partition subdirectories
+    /// were found, or the indices are not contiguous from 0. Data directories
+    /// written by kafko <= 0.2 (which stored segments directly under the topic
+    /// dir) trip this; they are not compatible with 0.3's partitioned layout.
+    #[error("topic '{topic}' has an invalid on-disk layout: {detail}")]
+    InvalidTopicLayout {
+        /// The topic whose directory could not be interpreted.
+        topic: String,
+        /// Human-readable description of what was wrong.
+        detail: String,
+    },
 }
 
 // `std::io::Error` is not `Clone` in stable Rust, so we synthesize an equivalent
@@ -120,6 +142,12 @@ impl Clone for KafkoError {
             },
             KafkoError::PartitionPanicked { payload } => KafkoError::PartitionPanicked {
                 payload: payload.clone(),
+            },
+            KafkoError::InvalidPartitionCount(n) => KafkoError::InvalidPartitionCount(*n),
+            KafkoError::InvalidGroupName(s) => KafkoError::InvalidGroupName(s.clone()),
+            KafkoError::InvalidTopicLayout { topic, detail } => KafkoError::InvalidTopicLayout {
+                topic: topic.clone(),
+                detail: detail.clone(),
             },
         }
     }

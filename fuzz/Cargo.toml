@@ -51,6 +51,27 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "topic_routing"
+path = "fuzz_targets/topic_routing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "topic_layout_recovery"
+path = "fuzz_targets/topic_layout_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "offset_store_parse"
+path = "fuzz_targets/offset_store_parse.rs"
+test = false
+doc = false
+bench = false
+
 # cargo-fuzz convention: this crate is its own workspace root, not a member
 # of the parent kafko workspace. The parent workspace also excludes "fuzz",
 # so regular cargo commands at the repo root don't touch this crate.

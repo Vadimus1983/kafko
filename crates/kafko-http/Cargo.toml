@@ -1,6 +1,6 @@
 [package]
 name = "kafko-http"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 publish = false
 description = "HTTP test harness for kafko: single-partition, three-codec topology behind axum."

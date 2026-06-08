@@ -1,6 +1,5 @@
 use bytes::Bytes;
-use kafko::{Log, LogConfig, Partition, Producer, Record};
-use std::sync::Arc;
+use kafko::{Log, LogConfig, Partition, Record};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -150,11 +149,10 @@ async fn partition_runs_retention_periodically() {
         retention_check_interval: Duration::from_millis(50),
         ..Default::default()
     };
-    let partition = Arc::new(Partition::open(dir.path(), cfg).await.unwrap());
-    let producer = Producer::new(partition.clone());
+    let partition = Partition::open(dir.path(), cfg).await.unwrap();
 
     for i in 0..10 {
-        producer.send_record(record(i)).await.unwrap();
+        partition.append(record(i)).await.unwrap();
     }
     partition.sync().await.unwrap();
 

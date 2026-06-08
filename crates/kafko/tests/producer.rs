@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use kafko::{LogConfig, Partition, Producer, Record};
+use kafko::{LogConfig, Producer, Record, Topic};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
@@ -11,51 +11,56 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-#[tokio::test]
-async fn send_returns_assigned_offset() {
-    let dir = TempDir::new().unwrap();
-    let partition = Arc::new(
-        Partition::open(dir.path(), LogConfig::default())
+async fn single_partition_topic(dir: &TempDir) -> Arc<Topic> {
+    Arc::new(
+        Topic::create(dir.path(), "t", 1, LogConfig::default())
             .await
             .unwrap(),
-    );
-    let producer = Producer::new(partition.clone());
+    )
+}
 
-    assert_eq!(
-        producer
-            .send(Some(Bytes::from_static(b"k")), Bytes::from_static(b"v"))
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        producer
-            .send(Some(Bytes::from_static(b"k")), Bytes::from_static(b"v"))
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(partition.high_water_mark(), 2);
+#[tokio::test]
+async fn send_returns_assigned_position() {
+    let dir = TempDir::new().unwrap();
+    let topic = single_partition_topic(&dir).await;
+    let producer = Producer::new(topic.clone());
+
+    let pos = producer
+        .send(Some(Bytes::from_static(b"k")), Bytes::from_static(b"v"))
+        .await
+        .unwrap();
+    assert_eq!(pos.partition(), 0);
+    assert_eq!(pos.offset(), 0);
+
+    let pos = producer
+        .send(Some(Bytes::from_static(b"k")), Bytes::from_static(b"v"))
+        .await
+        .unwrap();
+    assert_eq!(pos.offset(), 1);
+
+    assert_eq!(topic.partition(0).unwrap().high_water_mark(), 2);
 }
 
 #[tokio::test]
 async fn send_assigns_current_timestamp() {
     let dir = TempDir::new().unwrap();
-    let partition = Arc::new(
-        Partition::open(dir.path(), LogConfig::default())
-            .await
-            .unwrap(),
-    );
-    let producer = Producer::new(partition.clone());
+    let topic = single_partition_topic(&dir).await;
+    let producer = Producer::new(topic.clone());
 
     let before = now_ms();
-    let offset = producer
+    let pos = producer
         .send(None, Bytes::from_static(b"value"))
         .await
         .unwrap();
     let after = now_ms();
 
-    let record = partition.read_record_at(offset).await.unwrap().unwrap();
+    let record = topic
+        .partition(0)
+        .unwrap()
+        .read_record_at(pos.offset())
+        .await
+        .unwrap()
+        .unwrap();
     assert!(record.timestamp_ms() >= before);
     assert!(record.timestamp_ms() <= after);
 }
@@ -63,35 +68,36 @@ async fn send_assigns_current_timestamp() {
 #[tokio::test]
 async fn send_record_preserves_provided_timestamp() {
     let dir = TempDir::new().unwrap();
-    let partition = Arc::new(
-        Partition::open(dir.path(), LogConfig::default())
-            .await
-            .unwrap(),
-    );
-    let producer = Producer::new(partition.clone());
+    let topic = single_partition_topic(&dir).await;
+    let producer = Producer::new(topic.clone());
 
     let r = Record::new(12345, None, Bytes::from_static(b"value"));
-    let offset = producer.send_record(r.clone()).await.unwrap();
+    let pos = producer.send_record(r.clone()).await.unwrap();
 
-    let read_back = partition.read_record_at(offset).await.unwrap().unwrap();
+    let read_back = topic
+        .partition(0)
+        .unwrap()
+        .read_record_at(pos.offset())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(read_back, r);
 }
 
 #[tokio::test]
 async fn producer_is_cloneable_for_multi_task_use() {
     let dir = TempDir::new().unwrap();
-    let partition = Arc::new(
-        Partition::open(dir.path(), LogConfig::default())
-            .await
-            .unwrap(),
-    );
-    let producer = Producer::new(partition.clone());
+    let topic = single_partition_topic(&dir).await;
+    let producer = Producer::new(topic.clone());
 
     let mut handles = Vec::new();
     for i in 0..10u64 {
         let p = producer.clone();
         handles.push(tokio::spawn(async move {
-            p.send(None, Bytes::from(format!("msg-{i}"))).await.unwrap()
+            p.send(None, Bytes::from(format!("msg-{i}")))
+                .await
+                .unwrap()
+                .offset()
         }));
     }
 
@@ -101,5 +107,5 @@ async fn producer_is_cloneable_for_multi_task_use() {
     }
     offsets.sort();
     assert_eq!(offsets, (0..10).collect::<Vec<u64>>());
-    assert_eq!(partition.high_water_mark(), 10);
+    assert_eq!(topic.partition(0).unwrap().high_water_mark(), 10);
 }

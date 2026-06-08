@@ -9,7 +9,7 @@
 
 # kafko
 
-An in-process log with Kafka-like semantics for Rust. Topics, partitions, offset-based reads, replay, retention, compaction — all without a broker, a network hop, or a JVM.
+An in-process log with Kafka-like semantics for Rust. Topics, partitions with key-based routing, offset-based reads, replay, retention, resumable group consumers — all without a broker, a network hop, or a JVM.
 
 `kafko` exists for use cases where your data never needs to leave the process: embedded event sourcing, edge buffers, durable in-process pub/sub, deterministic integration tests without Docker or a broker, single-binary services that want a real log instead of a `VecDeque<T>` under a mutex. SQLite is to PostgreSQL what `kafko` is to Kafka.
 
@@ -21,12 +21,12 @@ An in-process log with Kafka-like semantics for Rust. Topics, partitions, offset
 
 A single Rust crate providing:
 
-- **Topics with partitions** — name a stream, append records, read them back by offset
+- **Topics with partitions** — name a stream, route records to partitions by key (`hash(key) % N`), read them back by offset
 - **Persistent segments** — records go to disk in framed `[len][crc32][ts][key_len][key][val_len][val]` form; segments rotate by size
 - **Offset-based reads** — consumers maintain their own cursor, can seek freely, can replay from anywhere
+- **Resumable consumers** — consumer groups commit per-partition offsets and resume where they left off across restarts
 - **Retention** — drop segments by age or total bytes
 - **Compression** — none / lz4 / zstd, configured per topic
-- **Compaction** — key-based dedup of the active log (v0.2)
 - **Crash recovery** — CRC verification on read, torn-tail truncate on startup
 - **Async API on `tokio`** — `Producer::send().await` resolves once the record is appended to the OS file (page cache); see [Durability](#durability) for the exact contract
 - **Single-writer-per-partition invariant** — no global mutex on the hot path
@@ -44,7 +44,7 @@ The killer use case isn't "replace Kafka." It's **testing log-shaped application
 
 ```toml
 [dependencies]
-kafko = "0.2"
+kafko = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 bytes = "1"
 ```
@@ -53,7 +53,7 @@ To use a compression codec, opt in via Cargo features — see
 [Compression features](#compression-features):
 
 ```toml
-kafko = { version = "0.2", features = ["compression-lz4"] }
+kafko = { version = "0.3", features = ["compression-lz4"] }
 ```
 
 ```rust
@@ -67,12 +67,12 @@ async fn main() -> kafko::Result<()> {
 
     // Produce
     let producer = broker.producer_for("orders").await?;
-    let offset = producer.send(None, Bytes::from("order-1")).await?;
-    println!("appended at offset {offset}");
+    let pos = producer.send(None, Bytes::from("order-1")).await?;
+    println!("appended at partition {} offset {}", pos.partition(), pos.offset());
 
     // Consume from the beginning
     let mut consumer = broker.consumer_for("orders").await?;
-    consumer.seek(0);
+    consumer.seek_all(0);
     let record = consumer.next_record().await?;
     println!("read: {:?}", record.value());
 
@@ -119,9 +119,9 @@ One broker object, many cheap handles. Each partition has its own writer task th
 
 ```
                 ┌─────────────────────────────────────┐
-                │  Kafko (Arc<KafkoInner>)            │
+                │  Kafko (broker)                     │
                 │  - Topic registry (RwLock)          │
-                │  - HashMap<(topic,part), Handle>    │
+                │  - HashMap<topic, Topic{partitions}>│
                 └────────┬────────────────────────────┘
                          │ Arc::clone (cheap)
         ┌────────────────┼────────────────┐
@@ -132,21 +132,25 @@ One broker object, many cheap handles. Each partition has its own writer task th
         └────────────────▼────────────────┘
               ┌──────────┴──────────┐
               ▼                     ▼
-       Partition writer task    Partition writer task
-       (single mpsc owner)      (single mpsc owner)
+    orders partition 0          orders partition 1
+    writer task (mpsc)          writer task (mpsc)
               │                     │
               ▼                     ▼
-       orders-0/ segments      payments-0/ segments
+       orders/0/ segments      orders/1/ segments
 ```
+
+A topic owns N partitions, each with its own writer task and log directory
+(`<topic>/<partition>/`); producers route by key, and a single consumer merges
+all partitions into one stream.
 
 ## Durability
 
-kafko v0.1 provides the **same durability contract as Kafka with `acks=1`** — leader has the record in page cache, not necessarily on disk:
+kafko provides the **same durability contract as Kafka with `acks=1`** — the record is in page cache, not necessarily on disk:
 
 - `Producer::send().await` resolves once the record has been written to the OS file via `write_all`. The bytes are in the **OS page cache**, owned by the kernel — they survive process crashes (panic, SIGKILL, OOM) because the process doesn't own them.
 - `Producer::send().await` does **not** fsync. Records may be lost if the OS crashes, the kernel panics, or the host loses power before automatic writeback (typically seconds on Linux / Windows).
 - Torn or partial writes at the tail of the active segment are detected and truncated on next startup via CRC scan; the sparse index is rebuilt from the verified segment.
-- For stricter guarantees, the partition exposes an explicit `sync()` you can call after `send`. A configurable per-call fsync policy (`EveryRecord` / `EveryBatch` / `EveryNms` / `Never`) is on the v0.2 roadmap.
+- For stricter guarantees, the partition exposes an explicit `sync()` you can call after `send`. A configurable per-call fsync policy (`EveryRecord` / `EveryBatch` / `EveryNms` / `Never`) is on the roadmap.
 
 ### Graceful shutdown
 
@@ -186,30 +190,30 @@ Reproducible from `scripts/kafko_docker_bench.ps1` (HTTP) and `cargo run --relea
 | Compression codecs | none / lz4 / zstd (per-topic) | same |
 | Runtime | `multi_thread`, default worker count (one per logical CPU) | `multi_thread, worker_threads = 4` |
 
-### HTTP path — records/sec (16 concurrent producers, wall-clock aggregate, v0.2.0)
+### HTTP path — records/sec (16 concurrent producers, wall-clock aggregate, v0.3.0)
 
 | Size | none | lz4 | zstd |
 |---|---:|---:|---:|
-| 64 B    | 138,235 | 138,422 | 123,325 |
-| 256 B   | 135,296 | 131,267 | 124,534 |
-| 512 B   | 130,665 | 133,469 | 122,423 |
-| 1 KiB   | 128,327 | 132,557 | 123,312 |
-| 4 KiB   |  52,667 | 127,308 | 110,416 |
-| 128 KiB |  12,123 |  40,426 |  44,621 |
-| 1 MiB   |     976 |   6,109 |   4,787 |
+| 64 B    | 140,674 | 136,543 | 124,193 |
+| 256 B   | 140,217 | 135,038 | 120,605 |
+| 512 B   | 134,811 | 128,644 | 116,505 |
+| 1 KiB   | 129,558 | 134,786 | 120,681 |
+| 4 KiB   |  54,811 | 115,875 | 113,156 |
+| 128 KiB |  11,932 |  47,120 |  57,091 |
+| 1 MiB   |     948 |   5,993 |   4,955 |
 
-### HTTP path — MiB/s committed (v0.2.0)
+### HTTP path — MiB/s committed (v0.3.0)
 
 | Size | none | lz4 | zstd |
 |---|---:|---:|---:|
-| 64 B    |     8.4 |     8.4 |     7.5 |
-| 256 B   |    33.0 |    32.0 |    30.4 |
-| 1 KiB   |   125.3 |   129.5 |   120.4 |
-| 4 KiB   |   205.7 | **497.3** | **431.3** |
-| 128 KiB | **1,516** | **5,053** | **5,578** |
-| 1 MiB   |     976 |   6,109 |   4,787 |
+| 64 B    |     8.6 |     8.3 |     7.6 |
+| 256 B   |    34.2 |    33.0 |    29.4 |
+| 1 KiB   |   126.5 |   131.6 |   117.9 |
+| 4 KiB   |   214.1 | **452.6** | **442.0** |
+| 128 KiB | **1,491** | **5,890** | **7,136** |
+| 1 MiB   |     948 |   5,993 |   4,955 |
 
-### HTTP path — latency p50 (codec = none, v0.2.0)
+### HTTP path — latency p50 (codec = none, v0.3.0)
 
 | Size | p50 |
 |---|---:|
@@ -217,58 +221,58 @@ Reproducible from `scripts/kafko_docker_bench.ps1` (HTTP) and `cargo run --relea
 | 256 B   | 0.11 ms |
 | 512 B   | 0.11 ms |
 | 1 KiB   | 0.12 ms |
-| 4 KiB   | 0.16 ms |
-| 128 KiB | 1.29 ms |
-| 1 MiB   | 10.43 ms |
+| 4 KiB   | 0.15 ms |
+| 128 KiB | 1.32 ms |
+| 1 MiB   | 10.59 ms |
 
 Latency is `oha`'s synchronous-per-connection request-response time (send → wait → receive → next), so this is honest end-to-end HTTP RTT through the kafko stack including write-to-page-cache.
 
-### Library hot path — records/sec (in-process, no HTTP, single `send()` per record, v0.2.0)
+### Library hot path — records/sec (in-process, no HTTP, single `send()` per record, v0.3.0)
 
 For users who embed kafko directly — the killer use case — the library-only numbers below show **single-`send()` per record** throughput across record sizes. Each row is `kafko-bench --features compression-all` driving 1 producer in a tight loop of `producer.send().await` calls; one round-trip through the partition writer per record.
 
 | Size | none | lz4 | zstd |
 |---|---:|---:|---:|
-| 64 B    |   282,619 |   285,377 |   238,996 |
-| 256 B   |   273,199 |   286,711 |   238,283 |
-| 1 KiB   |   216,075 |   267,409 |   242,199 |
-| 4 KiB   |   120,315 |   260,233 |   228,961 |
-| 128 KiB |    11,128 |    51,606 |    52,127 |
-| 1 MiB   |     3,032 |    10,561 |     5,283 |
+| 64 B    |   266,501 |   282,050 |   231,860 |
+| 256 B   |   254,358 |   270,850 |   223,580 |
+| 1 KiB   |   183,083 |   264,324 |   224,191 |
+| 4 KiB   |    95,958 |   219,993 |   216,098 |
+| 128 KiB |     9,904 |    47,411 |    61,125 |
+| 1 MiB   |     2,962 |     9,016 |     6,855 |
 
-**LZ4 beats `None` at every size** in v0.2.0 — at small records the per-call hash-table alloc is gone (see [Codec allocation profile](#codec-allocation-profile-v020)), and at large records the smaller on-disk write more than pays for the compression CPU. The 4 KiB cell is where `Compression::Lz4` first pulls clearly ahead: 260 K rec/s vs `None`'s 120 K, a 2.2× speedup.
+**LZ4 beats `None` at every size** in v0.3.0 — at small records the per-call hash-table alloc is gone (see [Codec allocation profile](#codec-allocation-profile-v030)), and at large records the smaller on-disk write more than pays for the compression CPU. The 4 KiB cell is where `Compression::Lz4` first pulls clearly ahead: 220 K rec/s vs `None`'s 96 K, a 2.3× speedup.
 
-For **batched** throughput at the same record size, see the `send_batch` table below — small-record amortization there reaches **3.66 M rec/s** for `None` and **4.05 M rec/s** for `Lz4` at N = 1024.
+For **batched** throughput at the same record size, see the `send_batch` table below — small-record amortization there reaches **2.33 M rec/s** for `None` and **4.14 M rec/s** for `Lz4` at N = 1024.
 
 Reproduce: `.\scripts\kafko_lib_multisize_bench.ps1`. Function-level timing + allocation snapshots and full methodology in `crates/kafko-bench/baselines/`.
 
-### Library hot path — `send_batch` vs single `send` (v0.2.0, 256 B records)
+### Library hot path — `send_batch` vs single `send` (v0.3.0, 256 B records)
 
 Same in-process path as above, but driven by `cargo bench -p kafko --bench send_batch` so a single producer either calls `send_batch(N)` once or loops N single `send()` calls. The gap is the mpsc round-trip cost saved per record.
 
 | Records per call (N) | `send_batch(N)` | Loop of N × `send()` | **Speedup** |
 |---:|---:|---:|---:|
-| 1 | 267 K rec/s | 273 K rec/s | 1.0× |
-| 8 | 1.14 M rec/s | 276 K rec/s | **4.1×** |
-| 32 | 1.61 M rec/s | 281 K rec/s | **5.7×** |
-| 128 | 2.92 M rec/s | 286 K rec/s | **10.2×** |
-| 1024 | **3.66 M rec/s** | 274 K rec/s | **13.3×** |
+| 1 | 272 K rec/s | 266 K rec/s | 1.0× |
+| 8 | 950 K rec/s | 251 K rec/s | **3.8×** |
+| 32 | 1.33 M rec/s | 251 K rec/s | **5.3×** |
+| 128 | 2.07 M rec/s | 263 K rec/s | **7.9×** |
+| 1024 | **2.33 M rec/s** | 269 K rec/s | **8.7×** |
 
-The single-`send` floor of ~275 K rec/s is the mpsc actor round-trip (~3.6 µs per record); batching saves `(N − 1)` of those round-trips and lowers to one `Log::append_batch` call. The curve flattens by N = 128 and is fully amortized by N = 1024.
+The single-`send` floor of ~265 K rec/s is the mpsc actor round-trip (~3.8 µs per record); batching saves `(N − 1)` of those round-trips and lowers to one `Log::append_batch` call. The curve flattens by N = 128 and is fully amortized by N = 1024.
 
 #### `send_batch` with compression (256 B all-zero values)
 
 | Compression | N = 1 | N = 128 | N = 1024 |
 |---|---:|---:|---:|
-| None | 267 K | 2.92 M | 3.66 M |
-| **Lz4** | 286 K | 3.01 M | **4.05 M** |
-| Zstd | 241 K | 1.06 M | 1.15 M |
+| None | 272 K | 2.07 M | 2.33 M |
+| **Lz4** | 307 K | 2.58 M | **4.14 M** |
+| Zstd | 238 K | 1.02 M | 1.13 M |
 
-**Lz4 is faster than None at large batches** because the all-zero payload compresses ~96 %, so the writer task spends proportionally less time on disk I/O. With genuinely random / incompressible data, expect Lz4 to track None within ±10 %. The per-record LZ4 hash-table allocation that hurt v0.1.1's memory profile is gone in v0.2.0 — see [Codec allocation profile](#codec-allocation-profile-v020) below.
+**Lz4 is faster than None at large batches** because the all-zero payload compresses ~96 %, so the writer task spends proportionally less time on disk I/O. With genuinely random / incompressible data, expect Lz4 to track None within ±10 %. The per-record LZ4 hash-table allocation that hurt v0.1.1's memory profile is gone — see [Codec allocation profile](#codec-allocation-profile-v030) below.
 
 Reproduce: `cargo bench -p kafko --bench send_batch --features compression-all -- --baseline v0_2_0` (compares against the pinned v0.2.0 baseline under `target/criterion/`; pass `--baseline v0_1_1` to compare against the v0.1.1 baseline preserved in the same tree).
 
-### Codec allocation profile (v0.2.0)
+### Codec allocation profile (v0.3.0)
 
 Both LZ4 and Zstd are alloc-free on the write hot path after thread warm-up.
 
@@ -283,13 +287,14 @@ Both LZ4 and Zstd are alloc-free on the write hot path after thread warm-up.
 Measured in the kafko-bench `lz4_sequential` scenario (100 000 LZ4 sends,
 256 B records, in-process): `compression::compress` allocates **24.9 KiB
 total** across the run — three thread-local hash tables, one per worker
-thread that touched the LZ4 path. That's **0.10 % of total process
+thread that touched the LZ4 path. That's **0.09 % of total process
 allocation** under the same workload that previously attributed ~93 % of
 heap traffic to this single function on v0.1.1's `lz4_flex 0.11`.
 
-Throughput-wise, LZ4 sequential now tracks no-codec sequential within ~3 %
-(164 K vs 160 K rec/s in the same hotpath-instrumented harness) — LZ4 is no
-longer detectably more expensive than `None` on small-record workloads.
+Throughput-wise, LZ4 sequential runs at **103 K rec/s** in the same
+hotpath-instrumented harness, ahead of no-codec sequential's **56 K** — the
+all-zero payload compresses away most of the write, so LZ4 carries no
+allocation penalty and comes out faster on this compressible workload.
 
 Reproduce: `.\scripts\kafko_hotpath_matrix.ps1` and read the resulting
 `scripts\tmp\hotpath_<ts>\lz4_sequential.txt` (the `compression::compress`
@@ -303,11 +308,11 @@ All throughput numbers are 256 B records, single producer, in-process. Larger re
 
 | Goal | API | Compression | `LogConfig` | Expected throughput | Per-record latency |
 |---|---|---|---|---|---|
-| **Max throughput, compressible payloads** | `send_batch(N≥128)` | `Lz4` | `default()` | **~4.0 M rec/s** | amortized over batch |
-| **Max throughput, incompressible payloads** | `send_batch(N≥128)` | `None` | `default()` | **~3.7 M rec/s** | amortized over batch |
+| **Max throughput, compressible payloads** | `send_batch(N≥128)` | `Lz4` | `default()` | **~4.1 M rec/s** | amortized over batch |
+| **Max throughput, incompressible payloads** | `send_batch(N≥128)` | `None` | `default()` | **~2.3 M rec/s** | amortized over batch |
 | **Disk-efficient (best compression ratio)** | `send_batch(N≥32)` | `Zstd` | `default()` | ~1.1 M rec/s | amortized over batch |
-| **Lowest single-record latency** | `send()` | `None` | `default()` | ~275 K rec/s | **~3.6 µs / send** |
-| **Many concurrent producers, no batch API** | `send()` × N tasks | `None` or `Lz4` | bump `batch_max_bytes` to 1 MiB | scales with concurrency until disk caps | ~3.6 µs / send |
+| **Lowest single-record latency** | `send()` | `None` | `default()` | ~265 K rec/s | **~3.8 µs / send** |
+| **Many concurrent producers, no batch API** | `send()` × N tasks | `None` or `Lz4` | bump `batch_max_bytes` to 1 MiB | scales with concurrency until disk caps | ~3.8 µs / send |
 
 ### Recipe 1 — Max throughput (compressible data)
 
@@ -332,7 +337,7 @@ let batch: Vec<(Option<Bytes>, Bytes)> = (0..1024)
 let offsets = producer.send_batch(batch).await?;
 ```
 
-Expect **~4.0 M rec/s** for redundant / structured payloads (e.g., JSON, logs, protobuf with shared schemas). Lz4 is genuinely free here — the disk-I/O saved more than pays for the compression CPU, and the per-call hash-table allocation that hurt v0.1.1's memory profile is gone in v0.2.0.
+Expect **~4.1 M rec/s** for redundant / structured payloads (e.g., JSON, logs, protobuf with shared schemas). Lz4 is genuinely free here — the disk-I/O saved more than pays for the compression CPU, and the per-call hash-table allocation that hurt v0.1.1's memory profile is gone.
 
 ### Recipe 2 — Max throughput (incompressible data)
 
@@ -350,7 +355,7 @@ broker
 // ...same send_batch(N≥128) loop as Recipe 1
 ```
 
-Expect **~3.7 M rec/s** for already-compressed payloads (encrypted blobs, JPEG/MP4 frames, random IDs).
+Expect **~2.3 M rec/s** for already-compressed payloads (encrypted blobs, JPEG/MP4 frames, random IDs).
 
 ### Recipe 3 — Lowest single-record latency
 
@@ -358,10 +363,10 @@ When you can't batch — interactive request handling, event-by-event ingestion 
 
 ```rust
 let producer = broker.producer_for("events").await?;
-let offset = producer.send(None, Bytes::from("one event")).await?;
+let pos = producer.send(None, Bytes::from("one event")).await?; // RecordPosition { partition, offset }
 ```
 
-Floor: ~**3.6 µs per send** (mpsc → writer-task → write-to-page-cache → reply), ~275 K rec/s per producer. **Compression doesn't help here** — at this latency scale the codec cost dominates over disk savings.
+Floor: ~**3.8 µs per send** (mpsc → writer-task → write-to-page-cache → reply), ~265 K rec/s per producer. **Compression doesn't help here** — at this latency scale the codec cost dominates over disk savings.
 
 ### Recipe 4 — Many concurrent producers
 
@@ -394,10 +399,13 @@ The `config_sweep` bench data settled these — don't waste time on:
 - **`index_interval`** — the default 4 KiB is the sweet spot. Smaller (≤ 1 KiB) measurably hurts because of constant index writes; larger (≥ 32 KiB) doesn't help.
 - **`segment_size_threshold` below 1 MiB** — the `small_footprint` preset in `config_sweep` is **32 % slower** than default because rotation pressure dominates. Only worth it if you're disk-constrained AND read-heavy on cold data.
 
-## What's in (v0.2.0)
+## What's in (v0.3.0)
 
-- Single partition per topic
-- Single consumer per topic
+- Multi-partition topics with key-based routing (`hash(key) % partitions`),
+  parallel per-partition writers, and keyless round-robin spread
+- Merged consumer that reads all of a topic's partitions as one stream
+- Resumable consumers: `consumer_for_group` + `commit` persist per-partition
+  committed offsets, so a group continues where it left off across restarts
 - File-based segments with CRC32 integrity
 - Crash recovery on startup (torn-tail truncate, sparse index rebuild)
 - Time- and size-based retention
@@ -416,16 +424,14 @@ The `config_sweep` bench data settled these — don't waste time on:
 
 ## Roadmap
 
-- Multi-partition with key-based routing
-- Consumer groups with independent committed offsets
+- Consumer groups: multi-member partition assignment + rebalancing (committed
+  offsets / resumable consumers already shipped)
 - Log compaction (key-based dedup)
 - Configurable fsync policy (`EveryRecord` / `EveryBatch` / `EveryNms` / `Never`)
 - Headers / record metadata
-- Per-topic config persistence (currently a topic's compression is set at
-  creation but not persisted across restarts)
-- Buffered WAL via `BufWriter` (design parked in `docs/design-bufwriter.md`;
-  amortizes the per-record `write()` syscall, expected ~40 % sequential
-  throughput win)
+- Per-topic `LogConfig` persistence (a topic's partition count persists via its
+  on-disk layout, but its compression / segment / retention settings are not
+  stored — they fall back to the broker default on reopen)
 
 ## Not on the roadmap
 
@@ -486,6 +492,9 @@ Existing targets:
 - `recovery_torn_tail` — feeds arbitrary bytes as the active segment file (`00…0.log`) and runs `Log::open`. Recovery must find the longest valid prefix, truncate the rest, and produce a Log where every offset in `[0, next_offset)` reads back successfully.
 - `sparse_index_parse` — feeds arbitrary bytes as the `00…0.index` file and exercises both `SparseIndex::open` and `lookup(u64)` against the parsed result. Neither must panic regardless of how malformed the entry table is.
 - `log_op_sequence` — model-based fuzzer that generates an `Arbitrary` sequence of `(append, sync, read, retention)` operations against a fresh `Log` with `Arbitrary` `LogConfig` (small thresholds force rotation pressure). Checks state-machine invariants: offsets are monotonic, no panic on any input, no committed-record corruption.
+- `topic_routing` — model-based fuzzer over a multi-partition `Topic` via `Producer`: an `Arbitrary` mix of keyed/keyless sends. Checks that a key always routes to the same partition, partitions are in range, offsets are sequential within each partition, and every acked record reads back with the same value.
+- `topic_layout_recovery` — feeds an `Arbitrary` on-disk topic layout (partition subdirectories with gaps/duplicates/non-numeric names, each holding arbitrary segment bytes) to `Topic::open`. Recovery must never panic — it returns either a usable topic or `InvalidTopicLayout`.
+- `offset_store_parse` — feeds arbitrary bytes as a consumer group's committed-offset file and runs the parse via `consumer_for_group`. Parsing must never panic; a corrupt file degrades to "resume from offset 0" and the resumed cursor is clamped to the high-water-mark.
 
 ## License
 

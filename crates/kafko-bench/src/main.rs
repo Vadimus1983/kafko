@@ -69,6 +69,16 @@ static TOTAL_RECORDS_TARGET: LazyLock<u64> = LazyLock::new(|| {
         .and_then(|s| s.parse().ok())
         .unwrap_or(100_000)
 });
+// Partition count for the benchmark topic. Default 1 reproduces the pre-0.3
+// single-writer numbers; >1 spreads keyless round-robin sends across that many
+// parallel writer tasks (the multi-partition throughput story).
+static PARTITIONS: LazyLock<u32> = LazyLock::new(|| {
+    std::env::var("KAFKO_PARTITIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1)
+});
 
 const SEQUENTIAL_TOPIC: &str = "scenario_sequential";
 const CONCURRENT_TOPIC: &str = "scenario_concurrent";
@@ -105,6 +115,7 @@ async fn main() -> Result<()> {
     eprintln!("  data dir : {data_dir}");
     eprintln!("  payload  : {value_size} B, no key");
     eprintln!("  target   : ~{total_records} records");
+    eprintln!("  partitions: {}", *PARTITIONS);
     eprintln!();
 
     let elapsed = match scenario.as_str() {
@@ -172,7 +183,7 @@ fn print_usage() {
 
 async fn run_sequential(broker: &Kafko) -> Result<std::time::Duration> {
     broker
-        .create_topic_with_config(SEQUENTIAL_TOPIC, default_cfg())
+        .create_topic_with_config_and_partitions(SEQUENTIAL_TOPIC, default_cfg(), *PARTITIONS)
         .await?;
     let producer = broker.producer_for(SEQUENTIAL_TOPIC).await?;
     let payload = Bytes::from(vec![0u8; *VALUE_SIZE]);
@@ -192,7 +203,7 @@ async fn run_sequential(broker: &Kafko) -> Result<std::time::Duration> {
 
 async fn run_concurrent(broker: &Kafko) -> Result<std::time::Duration> {
     broker
-        .create_topic_with_config(CONCURRENT_TOPIC, default_cfg())
+        .create_topic_with_config_and_partitions(CONCURRENT_TOPIC, default_cfg(), *PARTITIONS)
         .await?;
     let producer = broker.producer_for(CONCURRENT_TOPIC).await?;
     let payload = Bytes::from(vec![0u8; *VALUE_SIZE]);
@@ -224,7 +235,7 @@ async fn run_concurrent(broker: &Kafko) -> Result<std::time::Duration> {
 
 async fn run_batch(broker: &Kafko) -> Result<std::time::Duration> {
     broker
-        .create_topic_with_config(BATCH_TOPIC, default_cfg())
+        .create_topic_with_config_and_partitions(BATCH_TOPIC, default_cfg(), *PARTITIONS)
         .await?;
     let producer = broker.producer_for(BATCH_TOPIC).await?;
     let payload = Bytes::from(vec![0u8; *VALUE_SIZE]);
@@ -280,7 +291,7 @@ fn lz4_cfg() -> LogConfig {
 #[cfg(feature = "compression-lz4")]
 async fn run_lz4_sequential(broker: &Kafko) -> Result<std::time::Duration> {
     broker
-        .create_topic_with_config(LZ4_SEQUENTIAL_TOPIC, lz4_cfg())
+        .create_topic_with_config_and_partitions(LZ4_SEQUENTIAL_TOPIC, lz4_cfg(), *PARTITIONS)
         .await?;
     let producer = broker.producer_for(LZ4_SEQUENTIAL_TOPIC).await?;
     // Same value bytes as the None-path `sequential` scenario so the timing
@@ -312,7 +323,7 @@ fn zstd_cfg() -> LogConfig {
 #[cfg(feature = "compression-zstd")]
 async fn run_zstd_sequential(broker: &Kafko) -> Result<std::time::Duration> {
     broker
-        .create_topic_with_config(ZSTD_SEQUENTIAL_TOPIC, zstd_cfg())
+        .create_topic_with_config_and_partitions(ZSTD_SEQUENTIAL_TOPIC, zstd_cfg(), *PARTITIONS)
         .await?;
     let producer = broker.producer_for(ZSTD_SEQUENTIAL_TOPIC).await?;
     let payload = Bytes::from(vec![0u8; *VALUE_SIZE]);

@@ -134,14 +134,14 @@ async fn producer_and_consumer_for_topic_roundtrip() {
     let producer = broker.producer_for("orders").await.unwrap();
     let mut consumer = broker.consumer_for("orders").await.unwrap();
 
-    let offset = producer
+    let pos = producer
         .send(
             Some(Bytes::from_static(b"id-42")),
             Bytes::from_static(b"payload"),
         )
         .await
         .unwrap();
-    assert_eq!(offset, 0);
+    assert_eq!(pos.offset(), 0);
 
     let record = consumer.next_record().await.unwrap();
     assert_eq!(record.value(), &Bytes::from_static(b"payload"));
@@ -174,21 +174,24 @@ async fn topics_have_independent_offset_streams() {
         p_orders
             .send(None, Bytes::from_static(b"o0"))
             .await
-            .unwrap(),
+            .unwrap()
+            .offset(),
         0
     );
     assert_eq!(
         p_orders
             .send(None, Bytes::from_static(b"o1"))
             .await
-            .unwrap(),
+            .unwrap()
+            .offset(),
         1
     );
     assert_eq!(
         p_events
             .send(None, Bytes::from_static(b"e0"))
             .await
-            .unwrap(),
+            .unwrap()
+            .offset(),
         0
     );
 
@@ -197,14 +200,16 @@ async fn topics_have_independent_offset_streams() {
         p_orders
             .send(None, Bytes::from_static(b"o2"))
             .await
-            .unwrap(),
+            .unwrap()
+            .offset(),
         2
     );
     assert_eq!(
         p_events
             .send(None, Bytes::from_static(b"e1"))
             .await
-            .unwrap(),
+            .unwrap()
+            .offset(),
         1
     );
 }
@@ -288,7 +293,7 @@ async fn drop_without_shutdown_still_fsyncs_on_multi_thread_runtime() {
 
     let broker = Kafko::open(dir.path()).await.unwrap();
     let mut consumer = broker.consumer_for("orders").await.unwrap();
-    consumer.seek(0);
+    consumer.seek_all(0);
     for i in 0..record_count {
         let r = consumer
             .next_record()
@@ -326,7 +331,7 @@ async fn shutdown_is_a_durability_boundary_for_acked_records() {
 
     let broker = Kafko::open(dir.path()).await.unwrap();
     let mut consumer = broker.consumer_for("orders").await.unwrap();
-    consumer.seek(0);
+    consumer.seek_all(0);
     for i in 0..record_count {
         let r = consumer
             .next_record()

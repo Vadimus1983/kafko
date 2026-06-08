@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 660"
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 760"
      font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif">
 
   <defs>
@@ -22,7 +22,7 @@
   </text>
 
   <!-- Process boundary -->
-  <rect x="30" y="78" width="1040" height="560" rx="10"
+  <rect x="30" y="78" width="1040" height="660" rx="10"
         fill="#ffffff" stroke="#888" stroke-width="2" stroke-dasharray="8,5"/>
   <text x="50" y="103" font-size="13" font-style="italic" fill="#555">
     Your Rust process — single binary, one tokio runtime, no broker daemon, no network hop
@@ -80,7 +80,7 @@
     <text x="99"  y="13" text-anchor="middle" font-size="9" fill="#bf360c">5</text>
   </g>
   <text x="255" y="258" text-anchor="middle" font-size="8" font-style="italic" fill="#8d6e63">
-    append-only log
+    6 partitions · key-routed
   </text>
 
   <!-- Arrow 2 -->
@@ -142,7 +142,7 @@
     <text x="99" y="13" text-anchor="middle" font-size="9" fill="#bf360c">5</text>
   </g>
   <text x="557" y="258" text-anchor="middle" font-size="8" font-style="italic" fill="#8d6e63">
-    append-only log
+    6 partitions · key-routed
   </text>
 
   <!-- Arrow 4 -->
@@ -195,7 +195,7 @@
     <text x="45" y="13" text-anchor="middle" font-size="9" fill="#bf360c">2</text>
   </g>
   <text x="859" y="258" text-anchor="middle" font-size="8" font-style="italic" fill="#8d6e63">
-    append-only log
+    3 partitions · key-routed
   </text>
 
   <!-- Arrow 6 -->
@@ -250,20 +250,20 @@
   <g transform="translate(225, 415)">
     <rect x="0" y="0" width="105" height="55" fill="#fff" stroke="#616161" rx="4"/>
     <text x="52" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="#424242">raw_events/</text>
-    <text x="52" y="32" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">000…0.log</text>
-    <text x="52" y="44" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">000…0.index</text>
+    <text x="52" y="32" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">0/ 1/ … 5/</text>
+    <text x="52" y="44" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">offsets/enricher</text>
   </g>
   <g transform="translate(530, 415)">
     <rect x="0" y="0" width="105" height="55" fill="#fff" stroke="#616161" rx="4"/>
     <text x="52" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="#424242">enriched/</text>
-    <text x="52" y="32" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">000…0.log</text>
-    <text x="52" y="44" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">000…0.index</text>
+    <text x="52" y="32" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">0/ 1/ … 5/</text>
+    <text x="52" y="44" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">offsets/filter</text>
   </g>
   <g transform="translate(820, 415)">
     <rect x="0" y="0" width="105" height="55" fill="#fff" stroke="#616161" rx="4"/>
     <text x="52" y="16" text-anchor="middle" font-size="10" font-weight="700" fill="#424242">alerts/</text>
-    <text x="52" y="32" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">000…0.log</text>
-    <text x="52" y="44" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">000…0.index</text>
+    <text x="52" y="32" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">0/ 1/ 2/</text>
+    <text x="52" y="44" text-anchor="middle" font-size="8" font-family="monospace" fill="#757575">offsets/notifier</text>
   </g>
 
   <!-- Arrows from each topic to its disk dir -->
@@ -272,7 +272,7 @@
   <path d="M 859 270 L 859 415" stroke="#616161" stroke-width="1.5" stroke-dasharray="3,3" fill="none" marker-end="url(#arrow-disk)"/>
 
   <text x="557" y="495" text-anchor="middle" font-size="10" font-style="italic" fill="#555">
-    framed records · CRC32 integrity · sparse index · torn-tail recovery on startup
+    one log per partition (&lt;topic&gt;/&lt;n&gt;/) · framed records · CRC32 · sparse index · torn-tail recovery · committed offsets per group
   </text>
 
   <!-- ============ FOOTER ANNOTATIONS ============ -->
@@ -299,7 +299,26 @@
     Same broker, same process, no network — the pipeline is just function calls.
   </text>
   <text x="550" y="600" text-anchor="middle" font-size="10" font-style="italic" fill="#666">
-    Crash midway? Every stage replays from its own committed offset on restart. The log IS the durability boundary.
+    Crash midway? A group consumer (consumer_for_group + commit) resumes from its committed offset on restart. The log IS the durability boundary.
+  </text>
+
+  <!-- ============ NEW-IN-v0.3 FEATURE LEGEND ============ -->
+  <rect x="55" y="626" width="1005" height="96" rx="8"
+        fill="#f1f8e9" stroke="#558b2f" stroke-width="1.5"/>
+  <text x="557" y="647" text-anchor="middle" font-size="12" font-weight="700" fill="#33691e">
+    Kafka-style semantics (v0.3)
+  </text>
+  <text x="75" y="669" font-size="10.5" fill="#333">
+    <tspan font-weight="700" fill="#bf360c">Multi-partition + key routing</tspan>
+    — <tspan font-family="monospace" fill="#0d47a1">hash(key) % N</tspan> picks the partition; order is kept per key while partitions' writer tasks run in parallel.
+  </text>
+  <text x="75" y="688" font-size="10.5" fill="#333">
+    <tspan font-weight="700" fill="#4a148c">Merged consumer</tspan>
+    — one consumer reads every partition as a single stream; <tspan font-family="monospace" fill="#0d47a1">RecordPosition { partition, offset }</tspan> reports where each record landed.
+  </text>
+  <text x="75" y="707" font-size="10.5" fill="#333">
+    <tspan font-weight="700" fill="#1b5e20">Resumable group consumers</tspan>
+    — <tspan font-family="monospace" fill="#0d47a1">consumer_for_group(topic, group)</tspan> + <tspan font-family="monospace" fill="#0d47a1">commit()</tspan> persist a committed offset per partition; distinct groups read independently.
   </text>
 
 </svg>

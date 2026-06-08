@@ -2,7 +2,7 @@ use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 #[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
 use kafko::Compression;
-use kafko::{Consumer, LogConfig, Partition, Producer, Record};
+use kafko::{Consumer, LogConfig, Partition, Producer, Record, Topic};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Runtime};
@@ -205,13 +205,13 @@ fn bench_append_concurrent(c: &mut Criterion) {
 fn bench_produce_to_consume(c: &mut Criterion) {
     let rt = make_runtime();
     let dir = TempDir::new().unwrap();
-    let partition = Arc::new(rt.block_on(async {
-        Partition::open(dir.path(), LogConfig::default())
+    let topic = Arc::new(rt.block_on(async {
+        Topic::create(dir.path(), "bench", 1, LogConfig::default())
             .await
             .unwrap()
     }));
     let size = SIZES[0];
-    let producer = Producer::new(partition.clone());
+    let producer = Producer::new(topic.clone());
     let template = record_with_value_size(size);
     let next_offset = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -219,14 +219,14 @@ fn bench_produce_to_consume(c: &mut Criterion) {
         format!("produce_to_consume_latency_{}", size).as_str(),
         |b| {
             b.to_async(&rt).iter(|| {
-                let partition = partition.clone();
+                let topic = topic.clone();
                 let producer = producer.clone();
                 let template = template.clone();
                 let next_offset = next_offset.clone();
                 async move {
                     let offset = next_offset.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     producer.send_record(template).await.unwrap();
-                    let mut consumer = Consumer::from_partition_at(partition, offset);
+                    let mut consumer = Consumer::from_topic_at(topic, offset);
                     consumer.next_record().await.unwrap()
                 }
             });
@@ -234,7 +234,7 @@ fn bench_produce_to_consume(c: &mut Criterion) {
     );
 
     drop(producer);
-    drop(partition);
+    drop(topic);
     drop(dir);
 }
 

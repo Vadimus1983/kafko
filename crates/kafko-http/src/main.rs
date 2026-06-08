@@ -28,7 +28,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use kafko::{Compression, Kafko, LogConfig, Partition, Producer};
+use kafko::{Compression, Kafko, LogConfig, Producer, Topic};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -36,7 +36,7 @@ struct AppState {
     producer_none: Producer,
     producer_lz4: Producer,
     producer_zstd: Producer,
-    partition_none: Arc<Partition>,
+    topic_none: Arc<Topic>,
 }
 
 async fn produce_handler(
@@ -58,12 +58,18 @@ async fn produce_handler(
     producer
         .send(None, body)
         .await
-        .map(|offset| offset.to_string())
+        .map(|pos| pos.offset().to_string())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 async fn hwm_handler(State(state): State<AppState>) -> String {
-    state.partition_none.high_water_mark().to_string()
+    // Bench topics are single-partition, so partition 0 is the whole topic.
+    state
+        .topic_none
+        .partition(0)
+        .expect("topic has at least one partition")
+        .high_water_mark()
+        .to_string()
 }
 
 async fn ensure_topic(broker: &Kafko, name: &str, compression: Compression) -> Result<()> {
@@ -94,7 +100,7 @@ async fn main() -> Result<()> {
     let producer_none = broker.producer_for("bench_none").await?;
     let producer_lz4 = broker.producer_for("bench_lz4").await?;
     let producer_zstd = broker.producer_for("bench_zstd").await?;
-    let partition_none = broker
+    let topic_none = broker
         .topic("bench_none")
         .await
         .expect("topic 'bench_none' exists after create");
@@ -103,7 +109,7 @@ async fn main() -> Result<()> {
         producer_none,
         producer_lz4,
         producer_zstd,
-        partition_none,
+        topic_none,
     };
 
     let app = Router::new()

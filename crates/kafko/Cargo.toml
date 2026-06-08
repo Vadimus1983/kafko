@@ -1,6 +1,6 @@
 [package]
 name = "kafko"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "In-process log with Kafka-like semantics: topics, partitions, offset-based reads, replay, retention."
 license = "MIT OR Apache-2.0"

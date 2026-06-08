@@ -1,8 +1,12 @@
 use bytes::Bytes;
 #[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
 use kafko::Compression;
-use kafko::{Kafko, LogConfig, Partition, Record};
+use kafko::{Kafko, LogConfig, Partition, Record, RecordPosition};
 use tempfile::TempDir;
+
+fn offsets_only(positions: &[RecordPosition]) -> Vec<u64> {
+    positions.iter().map(|p| p.offset()).collect()
+}
 
 #[tokio::test]
 async fn send_batch_returns_sequential_offsets_starting_from_hwm() {
@@ -19,7 +23,7 @@ async fn send_batch_returns_sequential_offsets_starting_from_hwm() {
         ])
         .await
         .unwrap();
-    assert_eq!(offsets, vec![0, 1, 2]);
+    assert_eq!(offsets_only(&offsets), vec![0, 1, 2]);
 
     // A second batch picks up at the next HWM, not at zero.
     let more = producer
@@ -29,7 +33,7 @@ async fn send_batch_returns_sequential_offsets_starting_from_hwm() {
         ])
         .await
         .unwrap();
-    assert_eq!(more, vec![3, 4]);
+    assert_eq!(offsets_only(&more), vec![3, 4]);
 }
 
 #[tokio::test]
@@ -44,9 +48,9 @@ async fn send_batch_empty_input_returns_empty_vec_without_round_trip() {
 
     // HWM must not have moved.
     let mut consumer = broker.consumer_for("orders").await.unwrap();
-    consumer.seek(0);
+    consumer.seek_all(0);
     let single = producer.send(None, Bytes::from_static(b"x")).await.unwrap();
-    assert_eq!(single, 0);
+    assert_eq!(single.offset(), 0);
     let r = consumer.next_record().await.unwrap();
     assert_eq!(r.value().as_ref(), b"x");
 }
@@ -58,7 +62,7 @@ async fn send_batch_records_round_trip_through_consumer_in_order() {
     broker.create_topic("orders").await.unwrap();
     let producer = broker.producer_for("orders").await.unwrap();
     let mut consumer = broker.consumer_for("orders").await.unwrap();
-    consumer.seek(0);
+    consumer.seek_all(0);
 
     let payloads: Vec<Bytes> = (0..16).map(|i| Bytes::from(format!("rec-{i}"))).collect();
     let items: Vec<(Option<Bytes>, Bytes)> = payloads
@@ -67,7 +71,7 @@ async fn send_batch_records_round_trip_through_consumer_in_order() {
         .map(|v| (None, v))
         .collect();
     let offsets = producer.send_batch(items).await.unwrap();
-    assert_eq!(offsets, (0..16).collect::<Vec<_>>());
+    assert_eq!(offsets_only(&offsets), (0..16).collect::<Vec<_>>());
 
     for expected in &payloads {
         let r = consumer.next_record().await.unwrap();
@@ -82,7 +86,7 @@ async fn send_batch_records_preserves_caller_supplied_timestamps() {
     broker.create_topic("orders").await.unwrap();
     let producer = broker.producer_for("orders").await.unwrap();
     let mut consumer = broker.consumer_for("orders").await.unwrap();
-    consumer.seek(0);
+    consumer.seek_all(0);
 
     let records = vec![
         Record::new(1_700_000_000_000, None, Bytes::from_static(b"r0")),
@@ -90,7 +94,7 @@ async fn send_batch_records_preserves_caller_supplied_timestamps() {
         Record::new(1_700_000_001_000, None, Bytes::from_static(b"r2")),
     ];
     let offsets = producer.send_batch_records(records.clone()).await.unwrap();
-    assert_eq!(offsets, vec![0, 1, 2]);
+    assert_eq!(offsets_only(&offsets), vec![0, 1, 2]);
 
     for expected in &records {
         let r = consumer.next_record().await.unwrap();
@@ -121,7 +125,7 @@ async fn send_batch_is_durable_across_shutdown_and_reopen() {
 
     let broker = Kafko::open(dir.path()).await.unwrap();
     let mut consumer = broker.consumer_for("orders").await.unwrap();
-    consumer.seek(0);
+    consumer.seek_all(0);
     for (i, expected) in payloads.iter().enumerate() {
         let r = consumer
             .next_record()
@@ -197,7 +201,7 @@ async fn send_batch_round_trip_with_compression(compression: Compression) {
     broker.create_topic("orders").await.unwrap();
     let producer = broker.producer_for("orders").await.unwrap();
     let mut consumer = broker.consumer_for("orders").await.unwrap();
-    consumer.seek(0);
+    consumer.seek_all(0);
 
     // Highly-compressible payloads so we exercise the decompress path with
     // sizes that materially differ from the on-wire form.
@@ -243,7 +247,7 @@ async fn send_batch_larger_than_segment_threshold_still_round_trips() {
     broker.create_topic("orders").await.unwrap();
     let producer = broker.producer_for("orders").await.unwrap();
     let mut consumer = broker.consumer_for("orders").await.unwrap();
-    consumer.seek(0);
+    consumer.seek_all(0);
 
     let payloads: Vec<Bytes> = (0..64).map(|i| Bytes::from(format!("rec-{i:03}"))).collect();
     let items: Vec<(Option<Bytes>, Bytes)> = payloads
