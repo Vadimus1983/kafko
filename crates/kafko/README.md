@@ -190,7 +190,9 @@ for a runtime check.
 - Log compaction (key-based dedup)
 - Configurable fsync policy (`EveryRecord` / `EveryBatch` / `EveryNms` / `Never`)
 - Headers / record metadata
-- Per-topic config persistence (including partition count)
+- Per-topic `LogConfig` persistence (partition count already persists via the
+  on-disk layout; compression / segment / retention settings still fall back to
+  the broker default on reopen)
 
 ## Benchmarks, recipes, full docs
 

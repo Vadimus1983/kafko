@@ -433,12 +433,6 @@ The `config_sweep` bench data settled these — don't waste time on:
   on-disk layout, but its compression / segment / retention settings are not
   stored — they fall back to the broker default on reopen)
 
-## Not on the roadmap
-
-- Kafka wire-protocol compatibility (different category of tool)
-- Distributed replication (kafko is in-process by design — if you need replication, use Kafka)
-- Schema registry, Connect, Streams ecosystem (out of scope)
-
 ## Building and benchmarking
 
 This is a Cargo workspace. The library crate is `crates/kafko/` (publishable to crates.io); the HTTP test harness is `crates/kafko-http/` (`publish = false`).
