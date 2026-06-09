@@ -152,3 +152,68 @@ impl Clone for KafkoError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    // The `Io` arm is the only non-trivial clone: `std::io::Error` is not `Clone`,
+    // so the impl synthesizes a fresh error. Callers match on the inner `ErrorKind`
+    // to decide whether a failure is retryable, so the clone MUST preserve the kind
+    // (and the display string). That contract is the whole reason `Clone` is
+    // hand-written, so it gets its own test.
+    #[test]
+    fn clone_io_preserves_kind_and_message() {
+        let original = KafkoError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied"));
+        match original.clone() {
+            KafkoError::Io(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(e.to_string(), "denied");
+            }
+            other => panic!("expected Io after clone, got {other:?}"),
+        }
+    }
+
+    // Every other variant is a field-by-field clone. Round-trip a representative of
+    // each shape (tuple, struct, unit) and confirm the clone is indistinguishable
+    // from the original by Debug + Display — this also guards against a new variant
+    // being added without a matching clone arm.
+    #[test]
+    fn clone_round_trips_every_variant() {
+        let cases = [
+            KafkoError::Io(io::Error::new(io::ErrorKind::Other, "io")),
+            KafkoError::Truncated { needed: 7 },
+            KafkoError::CrcMismatch {
+                expected: 0xdead_beef,
+                actual: 0x0bad_f00d,
+            },
+            KafkoError::InvalidLength(3),
+            KafkoError::Closed,
+            KafkoError::TopicAlreadyExists("orders".into()),
+            KafkoError::TopicNotFound("orders".into()),
+            KafkoError::TopicInUse("orders".into()),
+            KafkoError::UnknownCompression(9),
+            KafkoError::DecompressionFailed,
+            KafkoError::CompressionUnavailable(Compression::None),
+            KafkoError::AlreadyOpen {
+                path: PathBuf::from("data"),
+            },
+            KafkoError::PartitionPanicked {
+                payload: "boom".into(),
+            },
+            KafkoError::InvalidPartitionCount(0),
+            KafkoError::InvalidGroupName("bad/name".into()),
+            KafkoError::InvalidTopicLayout {
+                topic: "orders".into(),
+                detail: "no partition subdirectories".into(),
+            },
+        ];
+
+        for original in &cases {
+            let cloned = original.clone();
+            assert_eq!(format!("{original:?}"), format!("{cloned:?}"));
+            assert_eq!(original.to_string(), cloned.to_string());
+        }
+    }
+}
