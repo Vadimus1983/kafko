@@ -8,6 +8,8 @@
 #     Kafka container -- server + client both on container loopback)
 #   - Tears the container down at the end
 #
+
+
 # Output: scripts/tmp/kafko_docker_bench_results_<YYYYMMDD-HHMMSS>.txt
 #
 # Usage:
